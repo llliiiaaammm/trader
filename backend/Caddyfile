@@ -1,1 +1,4 @@
-
+:80 {
+respond /health "ok" 200
+reverse_proxy /api* 127.0.0.1:8000
+}
