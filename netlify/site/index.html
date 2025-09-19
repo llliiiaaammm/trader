@@ -1,1 +1,58 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>RL Trader Dashboard</title>
+  <link rel="stylesheet" href="styles.css"/>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
+  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
+</head>
+<body>
+  <header>
+    <h1>RL Trader — Paper</h1>
+    <div id="status"></div>
+  </header>
+
+  <section class="cards">
+    <div class="card"><div class="k">Equity</div><div class="v" id="equity">-</div></div>
+    <div class="card"><div class="k">Today PnL</div><div class="v" id="pnl">-</div></div>
+    <div class="card"><div class="k">Trades Today</div><div class="v" id="trades">-</div></div>
+    <div class="card"><div class="k">Universe</div><div class="v" id="uni">-</div></div>
+    <div class="card"><div class="k">Max DD</div><div class="v" id="dd">-</div></div>
+  </section>
+
+  <section class="grid">
+    <canvas id="equityChart"></canvas>
+    <canvas id="pnlChart"></canvas>
+  </section>
+
+  <section>
+    <h2>Trade History</h2>
+    <div class="filters">
+      <input id="tickerFilter" placeholder="Filter ticker e.g. AAPL"/>
+      <select id="modeFilter">
+        <option value="">All</option>
+        <option value="LIVE">LIVE</option>
+        <option value="BACKTEST">BACKTEST</option>
+      </select>
+      <button id="reload">Reload</button>
+    </div>
+    <table id="tradesTable">
+      <thead>
+        <tr>
+          <th>ID</th><th>Mode</th><th>ET</th><th>Side</th><th>Ticker</th>
+          <th>Qty</th><th>Price</th><th>Notional</th><th>Fees bps</th>
+          <th>Risk</th><th>Realized PnL</th><th>Realized %</th>
+          <th>Equity After</th><th>Reason</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
+  </section>
+
+  <script src="app.js"></script>
+</body>
+</html>
 
