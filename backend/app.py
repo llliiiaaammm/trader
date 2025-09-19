@@ -324,7 +324,12 @@ def live_thread(stop: threading.Event):
                 with STATE_LOCK:
                     STATE['today_trades'] += 1
             today_et_now = now_utc().astimezone(pytz.timezone(MARKET_TZ)).date()
-            if today_et_now != today_et: today_et=today_et_now; today_pnl=0.0; with STATE_LOCK: STATE['today_trades']=0
+            if today_et_now != today_et:
+                today_et = today_et_now
+                today_pnl = 0.0
+            with STATE_LOCK:
+                STATE['today_trades'] = 0
+
             today_pnl += pnl
             with STATE_LOCK:
                 STATE['equity']=float(equity); STATE['today_pnl']=float(today_pnl)
