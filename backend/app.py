@@ -11,7 +11,7 @@ import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 import uvicorn
@@ -352,19 +352,23 @@ def require_key(authorization: Optional[str] = Header(default=None)):
 def healthz(): return {"ok": True}
 
 @app.get("/metrics")
-def metrics(_: None = require_key()):
-    with STATE_LOCK: return JSONResponse(STATE.copy())
+def metrics(_: None = Depends(require_key)):
+    with STATE_LOCK:
+        return JSONResponse(STATE.copy())
 
 @app.get("/trades")
-def trades(limit: int = 100, cursor: int = 0, _: None = require_key()):
-    limit = max(1, min(500, limit));
-    cur = DB.execute("SELECT * FROM trades WHERE trade_id>? ORDER BY trade_id DESC LIMIT ?", (cursor, limit))
+def trades(limit: int = 100, cursor: int = 0, _: None = Depends(require_key)):
+    limit = max(1, min(500, limit))
+    cur = DB.execute(
+        "SELECT * FROM trades WHERE trade_id>? ORDER BY trade_id DESC LIMIT ?",
+        (cursor, limit),
+    )
     rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
-    next_cursor = rows[-1]['trade_id'] if rows else cursor
+    next_cursor = rows[-1]["trade_id"] if rows else cursor
     return {"data": rows, "next_cursor": next_cursor}
 
 @app.get("/equity")
-def equity(window: str = "30d", _: None = require_key()):
+def equity(window: str = "30d", _: None = Depends(require_key)):
     cur = DB.execute("SELECT ts_utc, equity_after FROM trades ORDER BY trade_id ASC")
     rows = cur.fetchall()
     series = [{"t": r[0], "equity": r[1]} for r in rows]
