@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+pytz
+pandas
+numpy
+yfinance
+torch
+lxml
