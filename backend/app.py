@@ -38,6 +38,9 @@ WINDOW = int(os.getenv("WINDOW", "30"))
 NIGHTLY_TRAIN_ET = os.getenv("NIGHTLY_TRAIN_ET", "22:00")
 TRAIN_ROUNDS_PER_NIGHT = int(os.getenv("TRAIN_ROUNDS_PER_NIGHT", "4"))
 
+BACKTEST_WHEN_CLOSED = os.getenv("BACKTEST_WHEN_CLOSED", "true").lower() == "true"
+BACKTEST_POLL_SECONDS = int(os.getenv("BACKTEST_POLL_SECONDS", "5"))  # how fast to step the backtest
+
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
 
@@ -270,73 +273,154 @@ def trainer_thread(stop: threading.Event):
 def live_thread(stop: threading.Event):
     env, tickers = build_env()
     agent = PPO(WINDOW, env.N, PPO_CFG)
-    if os.path.exists(MODEL_PATH): agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+    if os.path.exists(MODEL_PATH):
+        agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
 
     equity = 1000.0
-    last_prices=None; buf=[]; today_et=now_utc().astimezone(pytz.timezone(MARKET_TZ)).date(); today_pnl=0.0
+    today_et = now_utc().astimezone(pytz.timezone(MARKET_TZ)).date()
+    today_pnl = 0.0
 
-    with STATE_LOCK: STATE.update({"equity":equity,"today_pnl":0.0,"today_trades":0})
+    last_prices = None
+    intraday_buf = []  # rolling WINDOW of minute returns for LIVE
+    back_s, back_obs = None, None  # state for BACKTEST
 
-    def log_trade(**kw): insert_trade(kw)
+    with STATE_LOCK:
+        STATE.update({"equity": equity, "today_pnl": 0.0, "today_trades": 0})
+
+    def log_trade_row(mode, side, ticker, qty, price, notional, fee_bps, risk, realized, realized_pct, equity_after, reason):
+        et = now_utc().astimezone(pytz.timezone(MARKET_TZ))
+        insert_trade({
+            "session_id": mode.lower(),
+            "mode": mode,
+            "ts_utc": now_utc().isoformat(),
+            "ts_et": et.isoformat(),
+            "side": side,
+            "ticker": ticker,
+            "qty": qty,
+            "fill_price": price,
+            "notional": notional,
+            "fees_bps": fee_bps,
+            "slippage_bps": 0.0,
+            "risk_frac": risk,
+            "position_before": 0.0,
+            "position_after": qty,
+            "cost_basis_before": 0.0,
+            "cost_basis_after": price,
+            "realized_pnl": realized,
+            "realized_pnl_pct": realized_pct,
+            "equity_after": equity_after,
+            "reason": reason
+        })
 
     while not stop.is_set():
         try:
-            if not is_market_open(now_utc()):
-                with STATE_LOCK: STATE['status']='idle'
-                time.sleep(5); continue
-            with STATE_LOCK: STATE['status']='live'
-
-            data = yf.download(tickers, period="2d", interval="1m", progress=False, auto_adjust=True)
-            closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
-            latest = closes.iloc[-1].dropna()
-            if last_prices is None:
-                last_prices = latest; time.sleep(POLL_SECONDS); continue
-            common = latest.index.intersection(last_prices.index)
-            rets = (latest[common]/last_prices[common]-1.0)
-            last_prices = latest
-            buf.append(rets.reindex(tickers).fillna(0.0).values)
-            if len(buf)>WINDOW: buf.pop(0)
-            if len(buf)<WINDOW:
-                time.sleep(POLL_SECONDS); continue
-
-            obs_np = np.stack(buf, axis=0).astype(np.float32)
-            with torch.no_grad(): logits,_=agent.net(torch.tensor(obs_np,dtype=torch.float32).unsqueeze(0)); a=int(torch.argmax(logits,dim=-1).item())
-            risk = 0.15
-            pnl=0.0; act_ticker='CASH'; qty=0.0; price=float(latest.mean()) if len(latest)>0 else 0.0; side='HOLD'
-            if a != env.cash:
-                r=float(obs_np[-1][a]); act_ticker=tickers[a]
-                notional = equity*risk
-                qty = notional / max(price,1e-6)
-                fee = notional*FEE_BPS
-                pnl = notional*(r) - fee
-                equity += pnl
-                side = 'BUY' if r>=0 else 'SELL'
-                realized = pnl if side=='SELL' else 0.0
-                realized_pct = realized/notional if notional>0 else 0.0
-                et = now_utc().astimezone(pytz.timezone(MARKET_TZ))
-                log_trade(
-                    session_id="live", mode="LIVE", ts_utc=now_utc().isoformat(), ts_et=et.isoformat(),
-                    side=side, ticker=act_ticker, qty=qty, fill_price=price, notional=notional, fees_bps=FEE_BPS,
-                    slippage_bps=0.0, risk_frac=risk, position_before=0.0, position_after=qty,
-                    cost_basis_before=0.0, cost_basis_after=price, realized_pnl=realized,
-                    realized_pnl_pct=realized_pct, equity_after=equity, reason="policy argmax"
-                )
-                with STATE_LOCK:
-                    STATE['today_trades'] += 1
+            # New trading day rollover
             today_et_now = now_utc().astimezone(pytz.timezone(MARKET_TZ)).date()
             if today_et_now != today_et:
                 today_et = today_et_now
                 today_pnl = 0.0
-            with STATE_LOCK:
-                STATE['today_trades'] = 0
+                with STATE_LOCK:
+                    STATE['today_trades'] = 0
 
-            today_pnl += pnl
-            with STATE_LOCK:
-                STATE['equity']=float(equity); STATE['today_pnl']=float(today_pnl)
+            if is_market_open(now_utc()):
+                # ---------- LIVE (minute data) ----------
+                with STATE_LOCK:
+                    STATE['status'] = 'live'
+                data = yf.download(tickers, period="2d", interval="1m", progress=False, auto_adjust=True)
+                closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
+                latest = closes.iloc[-1].dropna()
+                if last_prices is None:
+                    last_prices = latest
+                    time.sleep(POLL_SECONDS)
+                    continue
+                common = latest.index.intersection(last_prices.index)
+                rets = (latest[common] / last_prices[common] - 1.0)
+                last_prices = latest
+                intraday_buf.append(rets.reindex(tickers).fillna(0.0).values)
+                if len(intraday_buf) > WINDOW:
+                    intraday_buf.pop(0)
+                if len(intraday_buf) < WINDOW:
+                    time.sleep(POLL_SECONDS)
+                    continue
 
-            time.sleep(POLL_SECONDS)
+                obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)
+                with torch.no_grad():
+                    logits, _ = agent.net(torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0))
+                    a = int(torch.argmax(logits, dim=-1).item())
+
+                risk = 0.15
+                pnl = 0.0
+                act_ticker = 'CASH'
+                qty = 0.0
+                # approximate fill
+                price = float(latest.mean()) if len(latest) > 0 else 0.0
+                side = 'HOLD'
+                if a != env.cash:
+                    r = float(obs_np[-1][a])
+                    act_ticker = tickers[a]
+                    notional = equity * risk
+                    qty = notional / max(price, 1e-6)
+                    fee = notional * FEE_BPS
+                    pnl = notional * (r) - fee
+                    equity += pnl
+                    side = 'BUY' if r >= 0 else 'SELL'
+                    realized = pnl if side == 'SELL' else 0.0
+                    realized_pct = (realized / notional) if notional > 0 else 0.0
+                    log_trade_row("LIVE", side, act_ticker, qty, price, notional, FEE_BPS, risk, realized, realized_pct, equity, "policy argmax")
+                    with STATE_LOCK:
+                        STATE['today_trades'] += 1
+
+                today_pnl += pnl
+                with STATE_LOCK:
+                    STATE['equity'] = float(equity)
+                    STATE['today_pnl'] = float(today_pnl)
+
+                time.sleep(POLL_SECONDS)
+
+            elif BACKTEST_WHEN_CLOSED:
+                # ---------- BACKTEST (historical env) ----------
+                with STATE_LOCK:
+                    STATE['status'] = 'backtest'
+                # lazily init a random episode and then walk it step-by-step
+                if back_s is None:
+                    back_obs, back_s = env.reset(sample_cash(), sample_risk())
+                a, lp, v = agent.act(back_obs)
+                nobs, r, done, back_s = env.step(a, back_s)
+
+                # Synthesize a trade log similar to LIVE so charts fill
+                risk = sample_risk()
+                price = 100.0  # not used for PnL; cosmetic
+                notional = equity * risk
+                fee = notional * FEE_BPS
+                pnl = notional * (r) - fee
+                equity += pnl
+                side = 'BUY' if r >= 0 else 'SELL'
+                realized = pnl if side == 'SELL' else 0.0
+                realized_pct = (realized / notional) if notional > 0 else 0.0
+                ticker = tickers[a] if a != env.cash and a < len(tickers) else "CASH"
+                qty = notional / price if a != env.cash else 0.0
+
+                log_trade_row("BACKTEST", side, ticker, qty, price, notional, FEE_BPS, risk, realized, realized_pct, equity, "backtest step")
+                with STATE_LOCK:
+                    STATE['today_trades'] += 1
+                    STATE['equity'] = float(equity)
+                    STATE['today_pnl'] = float(STATE.get('today_pnl', 0.0) + pnl)
+
+                back_obs = nobs
+                if done:
+                    # start a new random episode
+                    back_obs, back_s = env.reset(sample_cash(), sample_risk())
+                time.sleep(BACKTEST_POLL_SECONDS)
+
+            else:
+                with STATE_LOCK:
+                    STATE['status'] = 'idle'
+                time.sleep(5)
+
         except Exception as e:
-            with STATE_LOCK: STATE['status']=f"error: {e}"; time.sleep(POLL_SECONDS)
+            with STATE_LOCK:
+                STATE['status'] = f"error: {e}"
+            time.sleep(POLL_SECONDS)
 
 # ------------------ API ------------------
 app = FastAPI()
