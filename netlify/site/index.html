@@ -1,58 +1,49 @@
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>RL Trader Dashboard</title>
-  <link rel="stylesheet" href="styles.css"/>
-  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/luxon@3"></script>
-  <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-luxon@1"></script>
+  <meta charset="utf-8" />
+  <title>RL Trader — Paper</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial; margin: 16px; }
+    .grid { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }
+    .stat { line-height: 1.6; }
+    canvas { max-width: 100%; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
+    th { text-align: left; }
+  </style>
 </head>
 <body>
-  <header>
-    <h1>RL Trader — Paper</h1>
-    <div id="status"></div>
-  </header>
-
-  <section class="cards">
-    <div class="card"><div class="k">Equity</div><div class="v" id="equity">-</div></div>
-    <div class="card"><div class="k">Today PnL</div><div class="v" id="pnl">-</div></div>
-    <div class="card"><div class="k">Trades Today</div><div class="v" id="trades">-</div></div>
-    <div class="card"><div class="k">Universe</div><div class="v" id="uni">-</div></div>
-    <div class="card"><div class="k">Max DD</div><div class="v" id="dd">-</div></div>
-  </section>
-
-  <section class="grid">
-    <canvas id="equityChart"></canvas>
-    <canvas id="pnlChart"></canvas>
-  </section>
-
-  <section>
-    <h2>Trade History</h2>
-    <div class="filters">
-      <input id="tickerFilter" placeholder="Filter ticker e.g. AAPL"/>
-      <select id="modeFilter">
-        <option value="">All</option>
-        <option value="LIVE">LIVE</option>
-        <option value="BACKTEST">BACKTEST</option>
-      </select>
-      <button id="reload">Reload</button>
+  <div class="grid">
+    <div class="stat">
+      <div id="mode">idle</div>
+      <div>Equity<br><b id="equity">$0.00</b></div>
+      <div>Today PnL<br><b id="pnl">$0.00</b></div>
+      <div>Trades Today<br><b id="trades">0</b></div>
+      <div>Universe<br><b id="universe">0</b></div>
+      <div>Max DD<br><b id="dd">0.00%</b></div>
     </div>
-    <table id="tradesTable">
-      <thead>
-        <tr>
-          <th>ID</th><th>Mode</th><th>ET</th><th>Side</th><th>Ticker</th>
-          <th>Qty</th><th>Price</th><th>Notional</th><th>Fees bps</th>
-          <th>Risk</th><th>Realized PnL</th><th>Realized %</th>
-          <th>Equity After</th><th>Reason</th>
-        </tr>
-      </thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <script src="app.js"></script>
+    <div>
+      <canvas id="equityChart" height="120"></canvas>
+      <h3>Recent trades</h3>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Mode</th><th>ET</th><th>Side</th><th>Ticker</th>
+            <th>Qty</th><th>Price</th><th>Notional</th><th>Risk</th><th>Realized PnL</th><th>Equity After</th><th>Reason</th>
+          </tr>
+        </thead>
+        <tbody id="tradesBody"></tbody>
+      </table>
+    </div>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script>
+    // Set these in Netlify (Site settings → Environment) or hardcode during testing:
+    window.API_BASE = window.API_BASE || "/api";
+    window.API_KEY  = window.API_KEY  || "<YOUR_API_KEY>"; // or leave blank if proxied by Netlify Functions
+  </script>
+  <script src="./app.js"></script>
 </body>
 </html>
-
