@@ -1,3 +1,5 @@
+console.log("DBG API_BASE bootstrap", { RAW_BASE: (window||{}).API_BASE, RAW_KEY: (window||{}).API_KEY });
+
 // --- Base URL + auth (fix undefined) ---
 const RAW_BASE = (typeof window !== "undefined" ? window.API_BASE : null);
 const API_BASE = (!RAW_BASE || RAW_BASE === "undefined" ? "/api" : RAW_BASE.trim().replace(/\/+$/, "")); // default /api
