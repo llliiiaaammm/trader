@@ -295,13 +295,13 @@ def insert_trade(row: Dict):
 # ================ GLOBAL STATE =================
 STATE = {
     "status": "idle",
-    "equity": 1000.0,
+    "equity": 0.0,             # will be set when a session starts
     "today_pnl": 0.0,
     "today_trades": 0,
     "universe": 0,
     "max_drawdown": 0.0,
     "mode": "idle",
-    "session_id": "bootstrap"  # current session (live day or backtest block)
+    "session_id": "bootstrap"
 }
 STATE_LOCK = threading.Lock()
 
@@ -378,13 +378,14 @@ def live_thread(stop: threading.Event):
     if os.path.exists(MODEL_PATH):
         agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
 
-    equity = 1000.0
-    peak_equity = equity
-    today_et = now_utc().astimezone(pytz.timezone(MARKET_TZ)).date()
+    # session-scoped vars (initialized on session start)
+    equity = 0.0
+    peak_equity = 0.0
     today_pnl = 0.0
 
-    last_prices = None
-    intraday_buf = []
+    # day/session tracking
+    tz = pytz.timezone(MARKET_TZ)
+    today_et = now_utc().astimezone(tz).date()
 
     # LIVE day-fixed parameters & session
     day_risk: Optional[float] = None
@@ -397,130 +398,164 @@ def live_thread(stop: threading.Event):
     backtest_session_id: Optional[str] = None
     last_block_counter: Optional[int] = None
 
+    # minute data cache
+    last_prices = None
+    intraday_buf: List[np.ndarray] = []
+
     with STATE_LOCK:
-        STATE.update({"equity": equity, "today_pnl": 0.0, "today_trades": 0, "max_drawdown":0.0})
+        STATE.update({"today_trades": 0, "today_pnl": 0.0, "max_drawdown": 0.0})
 
     def log_trade_row(session_id, mode, side, ticker, qty, price, notional, fee_bps, risk, realized, realized_pct, equity_after, reason):
-        et = now_utc().astimezone(pytz.timezone(MARKET_TZ))
+        et = now_utc().astimezone(tz)
         insert_trade({
-            "session_id": session_id,
-            "mode": mode,
-            "ts_utc": now_utc().isoformat(),
-            "ts_et": et.isoformat(),
-            "side": side,
-            "ticker": ticker,
-            "qty": qty,
-            "fill_price": price,
-            "notional": notional,
-            "fees_bps": fee_bps,
-            "slippage_bps": 0.0,
-            "risk_frac": risk,
-            "position_before": 0.0,
-            "position_after": qty,
-            "cost_basis_before": 0.0,
-            "cost_basis_after": price,
-            "realized_pnl": realized,
-            "realized_pnl_pct": realized_pct,
-            "equity_after": equity_after,
-            "reason": reason
+            "session_id": session_id, "mode": mode,
+            "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
+            "side": side, "ticker": ticker, "qty": qty, "fill_price": price,
+            "notional": notional, "fees_bps": fee_bps, "slippage_bps": 0.0,
+            "risk_frac": risk, "position_before": 0.0, "position_after": qty,
+            "cost_basis_before": 0.0, "cost_basis_after": price,
+            "realized_pnl": realized, "realized_pnl_pct": realized_pct,
+            "equity_after": equity_after, "reason": reason
         })
+
+    def start_live_session():
+        nonlocal day_risk, day_cash, live_session_id, equity, peak_equity, today_pnl, last_prices, intraday_buf
+        day_risk = sample_risk()
+        day_cash = sample_cash()
+        live_session_id = f"live-{today_et.isoformat()}"
+        equity = float(day_cash)
+        peak_equity = equity
+        today_pnl = 0.0
+        last_prices = None
+        intraday_buf.clear()
+        with STATE_LOCK:
+            STATE['session_id'] = live_session_id
+            STATE['equity'] = equity
+            STATE['today_pnl'] = 0.0
+            STATE['today_trades'] = 0
+        # optional: seed a zero trade so charts show the start point immediately
+        log_trade_row(live_session_id, "LIVE", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, day_risk, 0.0, 0.0, equity, "session start")
+
+    def start_backtest_block_session():
+        nonlocal backtest_session_id, equity, peak_equity, today_pnl, last_block_counter
+        # env reset chooses the block's risk+cash internally
+        back_obs, back_state = env.reset()
+        # capture returned local vars
+        return back_obs, back_state
 
     while not stop.is_set():
         try:
-            # day rollover
-            today_et_now = now_utc().astimezone(pytz.timezone(MARKET_TZ)).date()
-            if today_et_now != today_et:
-                today_et = today_et_now
-                today_pnl = 0.0
-                day_risk = None
-                day_cash = None
-                live_session_id = None
+            # rollover detection for LIVE date
+            et_now = now_utc().astimezone(tz)
+            if et_now.date() != today_et:
+                today_et = et_now.date()
+                # next live day will set new session at first live tick
+                day_risk = day_cash = live_session_id = None
+
+            live_open = is_market_open(now_utc())
+
+            # LIVE branch
+            if live_open:
                 with STATE_LOCK:
-                    STATE['today_trades'] = 0
+                    STATE['status'] = STATE['mode'] = 'live'
+                if live_session_id is None:
+                    start_live_session()
 
-            live_ok = is_market_open(now_utc())
-            # Drawdown halt for live mode (uses rolling peak)
-            dd = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
-            halted = dd >= MAX_LIVE_DRAWDOWN
+                # drawdown guard
+                dd = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
+                if dd >= MAX_LIVE_DRAWDOWN:
+                    time.sleep(POLL_SECONDS)
+                    continue
 
-            if live_ok and not halted:
-                # ensure fixed (risk, cash) and session for the day
-                if day_risk is None or day_cash is None or live_session_id is None:
-                    day_risk = sample_risk()
-                    day_cash = sample_cash()
-                    live_session_id = f"live-{today_et.isoformat()}"
-                    with STATE_LOCK:
-                        STATE['session_id'] = live_session_id
-
-                with STATE_LOCK: STATE['status']=STATE['mode']='live'
                 data = yf.download(tickers, period="2d", interval="1m", progress=False, auto_adjust=True)
                 closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
                 latest = closes.iloc[-1].dropna()
                 if last_prices is None:
                     last_prices = latest
                     time.sleep(POLL_SECONDS); continue
+
                 common = latest.index.intersection(last_prices.index)
                 rets = (latest[common] / last_prices[common] - 1.0)
                 last_prices = latest
+
                 intraday_buf.append(rets.reindex(tickers).fillna(0.0).values)
                 if len(intraday_buf) > WINDOW: intraday_buf.pop(0)
                 if len(intraday_buf) < WINDOW: time.sleep(POLL_SECONDS); continue
 
-                obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)  # [W, N_assets]
+                obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)  # [W, N]
                 risk = float(day_risk)
-                risk_col = np.full((WINDOW,1), risk, dtype=np.float32)
-                obs_np = np.concatenate([obs_np, risk_col], axis=1)
+                obs_np = np.concatenate([obs_np, np.full((WINDOW,1), risk, np.float32)], axis=1)
+
                 with torch.no_grad():
                     logits, _ = agent.net(torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0))
                     a = int(torch.argmax(logits, dim=-1).item())
 
-                pnl = 0.0; act_ticker='CASH'; qty=0.0; price = float(latest.mean()) if len(latest)>0 else 0.0
-                side='HOLD'
+                pnl = 0.0; price = float(latest.mean()) if len(latest)>0 else 0.0
+                side = 'HOLD'; ticker='CASH'; qty=0.0
                 if a != env.cash:
-                    r = float(obs_np[-1][a])  # last step return of chosen asset
-                    act_ticker = tickers[a]
+                    r = float(obs_np[-1][a])
+                    ticker = tickers[a]
                     notional = equity * risk
-                    qty = notional / max(price,1e-6)
+                    qty = notional / max(price, 1e-6)
                     fee = notional * FEE_BPS
                     pnl = notional * r - fee
                     equity += pnl
                     peak_equity = max(peak_equity, equity)
                     side = 'BUY' if r >= 0 else 'SELL'
                     realized = pnl if side == 'SELL' else 0.0
-                    realized_pct = (realized / notional) if notional > 0 else 0.0
-                    log_trade_row(live_session_id, "LIVE", side, act_ticker, qty, price, notional, FEE_BPS, risk, realized, realized_pct, equity, "policy argmax")
+                    realized_pct = (realized/notional) if notional>0 else 0.0
+                    log_trade_row(live_session_id, "LIVE", side, ticker, qty, price, notional, FEE_BPS, risk, realized, realized_pct, equity, "policy argmax")
                     with STATE_LOCK: STATE['today_trades'] += 1
 
                 today_pnl += pnl
+                dd = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
                 with STATE_LOCK:
                     STATE['equity'] = float(equity)
                     STATE['today_pnl'] = float(today_pnl)
                     STATE['max_drawdown'] = float(dd)
-
                 time.sleep(POLL_SECONDS)
+                continue
 
-            elif BACKTEST_WHEN_CLOSED:
-                with STATE_LOCK: STATE['status']=STATE['mode']='backtest'
-                # init or continue a backtest episode
+            # BACKTEST branch (after hours)
+            if BACKTEST_WHEN_CLOSED:
+                with STATE_LOCK:
+                    STATE['status'] = STATE['mode'] = 'backtest'
+                # start or continue a block session
                 if back_s is None:
-                    back_obs, back_s = env.reset()  # env tracks episodes & blocks internally
-                    # start a new session at the beginning of a block
+                    # env.reset() also assigns block risk & cash; grab risk from obs, cash is env.e0
+                    back_obs, back_s = env.reset()
                     backtest_session_id = f"bt-{int(time.time())}"
                     last_block_counter = env._episodes_in_block
+                    equity = float(env.e0)         # <-- starting cash per block
+                    peak_equity = equity
+                    today_pnl = 0.0
                     with STATE_LOCK:
                         STATE['session_id'] = backtest_session_id
+                        STATE['equity'] = equity
+                        STATE['today_pnl'] = 0.0
+                        STATE['today_trades'] = 0
+                    # seed start point for charts
+                    log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(back_obs[0,-1]), 0.0, 0.0, equity, "block start")
+
                 a, lp, v = agent.act(back_obs)
                 nobs, r, done, back_s = env.step(a, back_s)
 
-                # if we just rolled into a new block (env._episodes_in_block == 1), start a new session
+                # New block? env._episodes_in_block becomes 1 on new block's first episode
                 if env._episodes_in_block == 1 and last_block_counter != 1:
                     backtest_session_id = f"bt-{int(time.time())}"
+                    equity = float(env.e0)
+                    peak_equity = equity
+                    today_pnl = 0.0
                     with STATE_LOCK:
                         STATE['session_id'] = backtest_session_id
+                        STATE['equity'] = equity
+                        STATE['today_pnl'] = 0.0
+                        STATE['today_trades'] = 0
+                    log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(nobs[0,-1]), 0.0, 0.0, equity, "block start")
                 last_block_counter = env._episodes_in_block
 
-                # synthesize trade row to feed charts/history
-                risk = float(back_obs[0, -1])  # constant risk channel
+                # synthesize trade row
+                risk = float(back_obs[0, -1])
                 price = 100.0
                 notional = equity * risk
                 fee = notional * FEE_BPS
@@ -544,13 +579,16 @@ def live_thread(stop: threading.Event):
                     back_obs, back_s = env.reset()
                     last_block_counter = env._episodes_in_block
                 time.sleep(BACKTEST_POLL_SECONDS)
+                continue
 
-            else:
-                with STATE_LOCK: STATE['status']=STATE['mode']='idle'
-                time.sleep(5)
+            # idle if neither live nor backtesting
+            with STATE_LOCK:
+                STATE['status'] = STATE['mode'] = 'idle'
+            time.sleep(5)
 
         except Exception as e:
-            with STATE_LOCK: STATE['status'] = STATE['mode'] = f"error: {e}"
+            with STATE_LOCK:
+                STATE['status'] = STATE['mode'] = f"error: {e}"
             time.sleep(POLL_SECONDS)
 
 # ================ API =================
