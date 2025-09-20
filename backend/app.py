@@ -13,6 +13,7 @@ import torch.optim as optim
 from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi import Response
 import uvicorn
 
 # ================ CONFIG =================
@@ -293,9 +294,14 @@ def insert_trade(row: Dict):
 
 # ================ GLOBAL STATE =================
 STATE = {
-    "status":"idle","equity":1000.0","today_pnl":0.0,"today_trades":0,
-    "universe":0,"max_drawdown":0.0,"mode":"idle",
-    "session_id":"bootstrap"   # current session (live day or backtest block)
+    "status": "idle",
+    "equity": 1000.0,
+    "today_pnl": 0.0,
+    "today_trades": 0,
+    "universe": 0,
+    "max_drawdown": 0.0,
+    "mode": "idle",
+    "session_id": "bootstrap"  # current session (live day or backtest block)
 }
 STATE_LOCK = threading.Lock()
 
@@ -563,6 +569,9 @@ def require_key(authorization: Optional[str] = Header(default=None)):
 
 @app.get("/healthz")
 def healthz(): return {"ok": True}
+
+@app.head("/healthz")
+def healthz_head(): return Response(status_code=200)
 
 @app.get("/mode")
 def mode():
