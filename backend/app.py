@@ -83,22 +83,106 @@ FALLBACK_TICKERS = [
     "V","MA","HD","PG","AVGO","LLY","JNJ","TSLA","COST","MRK"
 ]
 
-def fetch_sp500() -> List[str]:
+# ------------------ S&P500 fetch (resilient + cached) ------------------
+import json, time, requests
+
+SP500_CACHE = "/data/sp500.json"
+SP500_TTL   = 24 * 3600  # seconds
+
+def _load_sp500_cache() -> Optional[List[str]]:
     try:
-        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
-        for t in tables:
-            if 'Symbol' in t.columns or 'Ticker symbol' in t.columns:
-                col = 'Symbol' if 'Symbol' in t.columns else 'Ticker symbol'
-                syms = t[col].astype(str).str.replace('.', '-', regex=False).str.strip().tolist()
-                syms = [s.replace('BRK.B','BRK-B').replace('BF.B','BF-B') for s in syms]
-                seen, out = set(), []
-                for s in syms:
-                    if s not in seen:
-                        seen.add(s); out.append(s)
-                return out
+        with open(SP500_CACHE, "r") as f:
+            obj = json.load(f)
+        if time.time() - float(obj.get("ts", 0)) < SP500_TTL:
+            return list(obj.get("tickers", []))
     except Exception:
         pass
-    return FALLBACK_TICKERS
+    return None
+
+def _save_sp500_cache(tickers: List[str]) -> None:
+    try:
+        os.makedirs(os.path.dirname(SP500_CACHE), exist_ok=True)
+        with open(SP500_CACHE, "w") as f:
+            json.dump({"ts": time.time(), "tickers": tickers}, f)
+    except Exception:
+        pass
+
+def fetch_sp500() -> List[str]:
+    # 0) cached?
+    cached = _load_sp500_cache()
+    if cached:
+        return cached
+
+    tickers: List[str] = []
+
+    # 1) Wikipedia (robust headers)
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Safari/537.36"}
+        html = requests.get(
+            "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies",
+            headers=headers, timeout=12
+        ).text
+        tables = pd.read_html(html)
+        for t in tables:
+            if "Symbol" in t.columns or "Ticker symbol" in t.columns:
+                col = "Symbol" if "Symbol" in t.columns else "Ticker symbol"
+                syms = (
+                    t[col].astype(str)
+                    .str.replace(".", "-", regex=False)  # BRK.B -> BRK-B
+                    .str.strip()
+                    .tolist()
+                )
+                # Normalize a couple known dots:
+                syms = [s.replace("BRK.B", "BRK-B").replace("BF.B", "BF-B") for s in syms]
+                seen, out = set(), []
+                for s in syms:
+                    if s and s not in seen:
+                        seen.add(s); out.append(s)
+                if len(out) >= 50:  # sanity threshold
+                    tickers = out
+                    break
+    except Exception:
+        pass
+
+    # 2) CSV mirror (DataHub)
+    if not tickers:
+        try:
+            df = pd.read_csv("https://datahub.io/core/s-and-p-500-companies/r/constituents.csv", timeout=12)
+            col = "Symbol" if "Symbol" in df.columns else "symbol"
+            syms = (
+                df[col].astype(str)
+                .str.replace(".", "-", regex=False)
+                .str.strip()
+                .tolist()
+            )
+            syms = [s.replace("BRK.B", "BRK-B").replace("BF.B", "BF-B") for s in syms]
+            seen, out = set(), []
+            for s in syms:
+                if s and s not in seen:
+                    seen.add(s); out.append(s)
+            if len(out) >= 50:
+                tickers = out
+        except Exception:
+            pass
+
+    # 3) yfinance helper (if present)
+    if not tickers:
+        try:
+            # yfinance exposes this on some versions
+            yf_list = getattr(yf, "tickers_sp500", None)
+            if callable(yf_list):
+                out = [s.replace(".", "-") for s in yf.tickers_sp500()]
+                if len(out) >= 50:
+                    tickers = out
+        except Exception:
+            pass
+
+    # 4) absolute fallback
+    if not tickers:
+        tickers = FALLBACK_TICKERS
+
+    _save_sp500_cache(tickers)
+    return tickers
 
 # --- keep this function the same ---
 def fetch_history(tickers: List[str], years: int) -> pd.DataFrame:
@@ -310,14 +394,33 @@ REINIT_EVENT = threading.Event()
 
 # ================ BUILD ENV =================
 def build_env():
-    tickers = fetch_sp500() if AUTO_FETCH_SP500 else FALLBACK_TICKERS
+    # Try to fetch; if anything goes wrong, fall back gracefully
+    try:
+        tickers = fetch_sp500() if AUTO_FETCH_SP500 else FALLBACK_TICKERS
+    except Exception:
+        tickers = FALLBACK_TICKERS
+
+    # Ensure we always have something
+    if not tickers:
+        tickers = FALLBACK_TICKERS
+
     prices = fetch_history(tickers, HISTORY_YEARS)
-    rets = prices.pct_change().dropna(how='all')
-    prices_aligned = prices.loc[rets.index]                    # NEW: align to returns index
-    env = Env(rets, prices_aligned, WINDOW, FEE_BPS)          # pass prices_aligned in
+
+    # If history came back empty, fall back again to the known small set
+    if prices is None or prices.empty:
+        prices = fetch_history(FALLBACK_TICKERS, HISTORY_YEARS)
+
+    # Final guard: if still empty, make a tiny synthetic series to keep the loop alive
+    if prices is None or prices.empty:
+        idx = pd.date_range(end=now_utc().date(), periods=365, freq="D")
+        rng = pd.Series(np.random.normal(0, 0.01, size=len(idx))).cumsum()
+        prices = pd.DataFrame({"AAPL": 100 * (1 + rng/10)}, index=idx)
+
+    rets = prices.pct_change().dropna(how="all")
+    env = Env(rets, WINDOW, FEE_BPS)
     with STATE_LOCK:
         STATE['universe'] = env.N_assets
-    return env, tickers
+    return env, list(rets.columns)
 
 # ================ TRAINER =================
 def rollout(env: Env, agent: PPO, steps: int):
