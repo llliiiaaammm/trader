@@ -236,20 +236,25 @@ class EpState:
 
 class Env:
     def __init__(self, returns_df: pd.DataFrame, prices_df: pd.DataFrame, window: int, fee_bps: float):
-        self.R = returns_df.dropna(axis=1, how='all').values.astype(np.float32)  # [T, N]
-        self.P = prices_df[self.tickers].values.astype(np.float32)               # [T, N]  <-- NEW
-        self.tickers = list(returns_df.columns)
-        self.N_assets = len(self.tickers)
-        self.W = window
-        self.cash = self.N_assets
-        self.fee_bps = fee_bps
+        # establish tickers FIRST
+        self.tickers   = list(returns_df.columns)
+        self.N_assets  = len(self.tickers)
+        self.W         = window
+        self.cash      = self.N_assets
+        self.fee_bps   = fee_bps
+
+        # matrices in the same ticker order
+        self.R = returns_df[self.tickers].dropna(axis=1, how='all').values.astype(np.float32)  # [T, N]
+        self.P = prices_df[self.tickers].values.astype(np.float32)                              # [T, N]
+
         self._obs_raw = self._build_obs_raw()
-        self.valid = list(range(self.W, self.R.shape[0]-1))
-        # episode-block sampling...
-        self.block_episodes = EPISODE_BLOCK
+        self.valid    = list(range(self.W, self.R.shape[0]-1))
+
+        # episode-block sampling
+        self.block_episodes    = EPISODE_BLOCK
         self._episodes_in_block = 0
-        self._block_risk = self._sample_risk()
-        self._block_cash = self._sample_cash()
+        self._block_risk       = self._sample_risk()
+        self._block_cash       = self._sample_cash()
 
     def _build_obs_raw(self):
         out = []
@@ -451,7 +456,7 @@ def build_env():
         idx = prices.index[1:] if len(prices.index) > 1 else pd.date_range(end=now_utc().date(), periods=120, freq="D")
         rets = pd.DataFrame({"AAPL": np.random.normal(0, 0.01, len(idx))}, index=idx)
 
-    env = Env(rets, WINDOW, FEE_BPS)
+    env = Env(rets, prices, WINDOW, FEE_BPS)
     with STATE_LOCK:
         STATE["universe"] = env.N_assets
     return env, list(rets.columns)
