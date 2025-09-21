@@ -1,28 +1,18 @@
 console.log("DBG API_BASE bootstrap", { RAW_BASE: (window||{}).API_BASE, RAW_KEY: (window||{}).API_KEY });
 
-// --- Base URL + auth (fix undefined) ---
+// --- Base URL + auth (sanitized) ---
 const RAW_BASE = (typeof window !== "undefined" ? window.API_BASE : null);
-const API_BASE = (!RAW_BASE || RAW_BASE === "undefined" ? "/api" : RAW_BASE.trim().replace(/\/+$/, "")); // default /api
+const API_BASE = (!RAW_BASE || RAW_BASE === "undefined" ? "/api" : RAW_BASE.trim().replace(/\/+$/, ""));
 const RAW_KEY  = (typeof window !== "undefined" ? window.API_KEY : null);
 const API_KEY  = (!RAW_KEY || RAW_KEY === "undefined" ? "" : RAW_KEY);
 
-// Generic GET
+// single, final getJSON
 async function getJSON(path) {
   const headers = { "Content-Type": "application/json" };
   if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
-  const url = `${API_BASE}${path}`;   // <-- uses sanitized base
+  const url = `${API_BASE}${path}`;
+  console.log("DBG fetch", { API_BASE, url, path });   // keep this log until fixed
   const res = await fetch(url, { headers, cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return await res.json();
-}
-
-async function getJSON(path) {
-  const headers = { "Content-Type": "application/json" };
-  // If you don’t have a Netlify Function adding the Authorization header, do it here:
-  if (window.API_KEY && window.API_KEY !== "<YOUR_API_KEY>") {
-    headers["Authorization"] = `Bearer ${window.API_KEY}`;
-  }
-  const res = await fetch(`${window.API_BASE}${path}`, { headers, cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return await res.json();
 }
