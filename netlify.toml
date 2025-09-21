@@ -1,8 +1,7 @@
 [functions]
   directory = "netlify/functions"
-  node_bundler = "esbuild"   # safe default on Netlify
+  node_bundler = "esbuild"
 
-# Proxy all /api/* to our function
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/proxy"
