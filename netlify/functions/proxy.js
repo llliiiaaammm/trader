@@ -2,43 +2,43 @@
 exports.handler = async (event) => {
   try {
     const backend = process.env.API_BASE_URL; // e.g. https://trader-xxxx.onrender.com
-    const apiKey  = process.env.API_KEY;      // same key your backend expects
+    const apiKey  = process.env.API_KEY;
 
     if (!backend || !apiKey) {
-      return { statusCode: 500, body: "Missing API_BASE_URL or API_KEY env var" };
+      return { statusCode: 500, body: "Missing API_BASE_URL or API_KEY" };
     }
 
-    // incoming path: /.netlify/functions/proxy OR /api/...
-    // We redirect /api/* to this function, so event.path starts with /api/...
-    const pathNoApi = event.path.replace(/^\/api/, ""); // keep leading slash for backend
+    // Build target URL: strip /api prefix, keep query string
+    const pathNoApi = event.path.replace(/^\/api/, "");
     const qs = event.rawQuery ? `?${event.rawQuery}` : "";
     const target = backend.replace(/\/+$/, "") + pathNoApi + qs;
 
-    // Build headers for upstream
-    const headers = new Headers();
+    // Forward headers, but set Authorization and Host for upstream
+    const headers = {};
     for (const [k, v] of Object.entries(event.headers || {})) {
-      if (!["host", "authorization"].includes(k.toLowerCase())) headers.set(k, v);
+      const lk = k.toLowerCase();
+      if (lk !== "host" && lk !== "authorization") headers[k] = v;
     }
-    headers.set("Authorization", `Bearer ${apiKey}`);
-    headers.set("Host", new URL(backend).host);
+    headers["Authorization"] = `Bearer ${apiKey}`;
+    headers["Host"] = new URL(backend).host;
 
-    const upstream = await fetch(target, {
-      method: event.httpMethod,
-      headers,
-      body: event.body,
-    });
+    // Build fetch init; DO NOT send body for GET/HEAD
+    const init = { method: event.httpMethod, headers };
+    if (event.httpMethod !== "GET" && event.httpMethod !== "HEAD" && event.body) {
+      init.body = event.isBase64Encoded ? Buffer.from(event.body, "base64") : event.body;
+    }
 
-    // Stream back the response (binary-safe)
-    const buf = await upstream.arrayBuffer();
-    const base64 = Buffer.from(buf).toString("base64");
+    const upstream = await fetch(target, init);
+
+    // Read upstream as text (covers JSON & text). Good enough for our API.
+    const respText = await upstream.text();
     const respHeaders = {};
     upstream.headers.forEach((v, k) => (respHeaders[k] = v));
 
     return {
       statusCode: upstream.status,
       headers: respHeaders,
-      body: base64,
-      isBase64Encoded: true,
+      body: respText,
     };
   } catch (err) {
     return { statusCode: 502, body: `Proxy error: ${err}` };
