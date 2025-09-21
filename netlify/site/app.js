@@ -42,8 +42,6 @@ document.getElementById("resetBtn")?.addEventListener("click", async () => {
 
 const fmtUSD = n => (n>=0? "$"+n.toFixed(2) : "-$"+Math.abs(n).toFixed(2));
 
-let eqChart;
-
 async function loadMetrics() {
   const m = await getJSON("/metrics");
   document.getElementById("mode").textContent = m.status || "idle";
@@ -54,30 +52,48 @@ async function loadMetrics() {
   document.getElementById("dd").textContent = ((Number(m.max_drawdown||0))*100).toFixed(2)+"%";
 }
 
+let eqChart;
+
 async function loadEquity() {
-  const data = await getJSON("/equity"); // defaults to current session
-  const points = data.series || [];
-  const labels = points.map(p => new Date(p.t));
-  const values = points.map(p => Number(p.equity));
+  // API returns: { series: [{ t: ISO_STRING, equity: number }], session: "..." }
+  const { series = [] } = await getJSON("/equity");
+
+  const points = series.map(p => ({
+    x: p.t,                 // ISO string is fine; adapter parses it
+    y: Number(p.equity)
+  }));
 
   if (!eqChart) {
     const ctx = document.getElementById("equityChart").getContext("2d");
     eqChart = new Chart(ctx, {
       type: "line",
-      data: { labels, datasets: [{ label: "Equity", data: values, fill: false, tension: 0.2 }] },
+      data: {
+        datasets: [{
+          label: "Equity",
+          data: points,
+          fill: false,
+          tension: 0.2,
+          pointRadius: 0
+        }]
+      },
       options: {
-        parsing: false,
         animation: false,
+        parsing: true,      // enable {x,y} parsing
         scales: {
-          x: { type: "time", time: { unit: "minute" } },
+          x: {
+            type: "time",
+            time: {
+              unit: "minute",          // 'hour' or 'day' if you prefer
+              tooltipFormat: "MMM d, HH:mm"
+            }
+          },
           y: { beginAtZero: false }
         },
         plugins: { legend: { display: true } }
       }
     });
   } else {
-    eqChart.data.labels = labels;
-    eqChart.data.datasets[0].data = values;
+    eqChart.data.datasets[0].data = points;
     eqChart.update();
   }
 }
