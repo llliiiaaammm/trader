@@ -14,7 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi import Response
-from pydantic import BaseModel  # <-- added
+from pydantic import BaseModel
 import uvicorn
 
 # ================ CONFIG =================
@@ -41,7 +41,7 @@ WINDOW = int(os.getenv("WINDOW", "30"))   # lookback window (minutes for live; d
 AUTO_FETCH_SP500 = os.getenv("AUTO_FETCH_SP500", "true").lower() == "true"
 
 # Risk/cash sampling (held constant for blocks of episodes in BACKTEST)
-EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))   # hold risk & starting cash for N episodes
+EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))
 START_CASH_MIN = float(os.getenv("START_CASH_MIN", "1"))
 START_CASH_MAX = float(os.getenv("START_CASH_MAX", "1000"))
 RISK_MIN = float(os.getenv("RISK_MIN", "0.01"))
@@ -50,10 +50,10 @@ RISK_JITTER = float(os.getenv("RISK_JITTER", "0.05"))
 
 # Trading frictions & safety
 FEE_BPS = float(os.getenv("FEE_BPS", "0.0005"))
-MAX_LIVE_DRAWDOWN = float(os.getenv("MAX_LIVE_DRAWDOWN", "0.20"))  # 20% halt
+MAX_LIVE_DRAWDOWN = float(os.getenv("MAX_LIVE_DRAWDOWN", "0.20"))
 
-# Admin reset password (for /admin/reset)
-ADMIN_RESET_PASSWORD = os.getenv("ADMIN_RESET_PASSWORD", "liamb123abc")  # <-- added
+# Admin reset password
+ADMIN_RESET_PASSWORD = os.getenv("ADMIN_RESET_PASSWORD", "please-change-me")
 
 # Make sure folders exist
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -115,9 +115,7 @@ class EpState:
 
 class Env:
     """
-    Observation: [W, N_assets + 1]
-      - N_assets columns = sliding window of daily returns
-      - +1 constant column with the risk level for this episode
+    Observation: [W, N_assets + 1]  (+1 column = episode risk)
     Actions: N_assets + 1 (assets + CASH)
     Reward: pnl / e0, where pnl = equity * risk * (r - fee)
     """
@@ -140,7 +138,7 @@ class Env:
         out = []
         for i in range(self.W, self.R.shape[0]):
             out.append(self.R[i-self.W:i, :])  # [W, N_assets]
-        return np.array(out, dtype=np.float32)  # [T-W+1, W, N_assets]
+        return np.array(out, dtype=np.float32)
 
     def _with_risk(self, raw, risk: float):
         risk_col = np.full((self.W, 1), float(risk), dtype=np.float32)
@@ -164,7 +162,6 @@ class Env:
             self._block_cash = self._sample_cash()
 
     def reset(self, starting_cash: Optional[float] = None, risk: Optional[float] = None, seed=None):
-        """BACKTEST uses block risk/cash unless overridden."""
         if seed is not None:
             random.seed(seed); np.random.seed(seed)
         self._maybe_roll_block()
@@ -299,7 +296,7 @@ def insert_trade(row: Dict):
 # ================ GLOBAL STATE =================
 STATE = {
     "status": "idle",
-    "equity": 0.0,             # will be set when a session starts
+    "equity": 0.0,
     "today_pnl": 0.0,
     "today_trades": 0,
     "universe": 0,
@@ -308,6 +305,9 @@ STATE = {
     "session_id": "bootstrap"
 }
 STATE_LOCK = threading.Lock()
+
+# **NEW**: reinit trigger used by /admin/reset
+REINIT_EVENT = threading.Event()
 
 # ================ BUILD ENV =================
 def build_env():
@@ -321,14 +321,13 @@ def build_env():
 # ================ TRAINER =================
 def rollout(env: Env, agent: PPO, steps: int):
     obs_buf, act_buf, logp_buf, rew_buf, val_buf = [],[],[],[],[]
-    obs, s = env.reset()  # BACKTEST: env handles block risk/cash internally
+    obs, s = env.reset()
     for _ in range(steps):
         a, lp, v = agent.act(obs)
         nobs, r, done, s = env.step(a, s)
         obs_buf.append(obs); act_buf.append(a); logp_buf.append(lp); rew_buf.append(r); val_buf.append(v)
         obs = nobs
         if done: obs, s = env.reset()
-    # GAE
     gamma=PPO_CFG['gamma']; lam=PPO_CFG['gae_lambda']
     rewards=np.array(rew_buf,dtype=np.float32); values=np.array(val_buf+[0.0],dtype=np.float32)
     adv=np.zeros_like(rewards); gae=0.0
@@ -368,7 +367,7 @@ def trainer_thread(stop: threading.Event):
         if is_market_open(now_utc()) or not is_nightly(now_utc()):
             continue
         with STATE_LOCK: STATE['status']=STATE['mode']='training'
-        for _ in range(TRAIN_ROUNDS_PER_NIGHT):
+        for _ in range(TRAIN_ROUNDS_PER_NIGHT'):
             batch=rollout(env,agent,PPO_CFG['rollout_steps']); agent.update(batch)
         save_checkpoint(agent, "nightly")
         with STATE_LOCK: STATE['status']=STATE['mode']='idle'
@@ -382,27 +381,22 @@ def live_thread(stop: threading.Event):
     if os.path.exists(MODEL_PATH):
         agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
 
-    # session-scoped vars (initialized on session start)
     equity = 0.0
     peak_equity = 0.0
     today_pnl = 0.0
 
-    # day/session tracking
     tz = pytz.timezone(MARKET_TZ)
     today_et = now_utc().astimezone(tz).date()
 
-    # LIVE day-fixed parameters & session
     day_risk: Optional[float] = None
     day_cash: Optional[float] = None
     live_session_id: Optional[str] = None
 
-    # BACKTEST block session tracking
     back_s = None
     back_obs = None
     backtest_session_id: Optional[str] = None
     last_block_counter: Optional[int] = None
 
-    # minute data cache
     last_prices = None
     intraday_buf: List[np.ndarray] = []
 
@@ -437,39 +431,76 @@ def live_thread(stop: threading.Event):
             STATE['equity'] = equity
             STATE['today_pnl'] = 0.0
             STATE['today_trades'] = 0
-        # optional: seed a zero trade so charts show the start point immediately
         log_trade_row(live_session_id, "LIVE", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, day_risk, 0.0, 0.0, equity, "session start")
 
-    def start_backtest_block_session():
-        nonlocal backtest_session_id, equity, peak_equity, today_pnl, last_block_counter
-        # env reset chooses the block's risk+cash internally
-        back_obs, back_state = env.reset()
-        # capture returned local vars
-        return back_obs, back_state
+    # helper to rebuild runtime after reset
+    def do_full_reinit():
+        nonlocal env, tickers, n_inputs, n_actions, agent
+        nonlocal equity, peak_equity, today_pnl, today_et
+        nonlocal day_risk, day_cash, live_session_id
+        nonlocal back_s, back_obs, backtest_session_id, last_block_counter
+        nonlocal last_prices, intraday_buf
+
+        env, tickers = build_env()
+        n_inputs  = env.N_assets + 1
+        n_actions = env.N_assets + 1
+        agent = PPO(WINDOW, n_inputs, n_actions, PPO_CFG)
+        if os.path.exists(MODEL_PATH):
+            agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
+
+        equity = 0.0
+        peak_equity = 0.0
+        today_pnl = 0.0
+        today_et = now_utc().astimezone(tz).date()
+
+        day_risk = None
+        day_cash = None
+        live_session_id = None
+
+        back_s = None
+        back_obs = None
+        backtest_session_id = None
+        last_block_counter = None
+
+        last_prices = None
+        intraday_buf = []
+
+        with STATE_LOCK:
+            STATE.update({
+                "today_trades": 0,
+                "today_pnl": 0.0,
+                "max_drawdown": 0.0,
+                "session_id": "bootstrap",
+                "equity": 0.0,
+                "mode": "idle",
+                "status": "idle"
+            })
 
     while not stop.is_set():
         try:
-            # rollover detection for LIVE date
+            # react to admin reset
+            if REINIT_EVENT.is_set():
+                do_full_reinit()
+                REINIT_EVENT.clear()
+                time.sleep(0.5)
+                continue
+
             et_now = now_utc().astimezone(tz)
             if et_now.date() != today_et:
                 today_et = et_now.date()
-                # next live day will set new session at first live tick
                 day_risk = day_cash = live_session_id = None
 
             live_open = is_market_open(now_utc())
 
-            # LIVE branch
             if live_open:
                 with STATE_LOCK:
                     STATE['status'] = STATE['mode'] = 'live'
                 if live_session_id is None:
                     start_live_session()
 
-                # drawdown guard
                 dd = 0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity
                 if dd >= MAX_LIVE_DRAWDOWN:
-                    time.sleep(POLL_SECONDS)
-                    continue
+                    time.sleep(POLL_SECONDS); continue
 
                 data = yf.download(tickers, period="2d", interval="1m", progress=False, auto_adjust=True)
                 closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
@@ -486,7 +517,7 @@ def live_thread(stop: threading.Event):
                 if len(intraday_buf) > WINDOW: intraday_buf.pop(0)
                 if len(intraday_buf) < WINDOW: time.sleep(POLL_SECONDS); continue
 
-                obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)  # [W, N]
+                obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)
                 risk = float(day_risk)
                 obs_np = np.concatenate([obs_np, np.full((WINDOW,1), risk, np.float32)], axis=1)
 
@@ -520,17 +551,14 @@ def live_thread(stop: threading.Event):
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # BACKTEST branch (after hours)
             if BACKTEST_WHEN_CLOSED:
                 with STATE_LOCK:
                     STATE['status'] = STATE['mode'] = 'backtest'
-                # start or continue a block session
                 if back_s is None:
-                    # env.reset() also assigns block risk & cash; grab risk from obs, cash is env.e0
                     back_obs, back_s = env.reset()
                     backtest_session_id = f"bt-{int(time.time())}"
                     last_block_counter = env._episodes_in_block
-                    equity = float(env.e0)         # <-- starting cash per block
+                    equity = float(env.e0)
                     peak_equity = equity
                     today_pnl = 0.0
                     with STATE_LOCK:
@@ -538,13 +566,11 @@ def live_thread(stop: threading.Event):
                         STATE['equity'] = equity
                         STATE['today_pnl'] = 0.0
                         STATE['today_trades'] = 0
-                    # seed start point for charts
                     log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(back_obs[0,-1]), 0.0, 0.0, equity, "block start")
 
                 a, lp, v = agent.act(back_obs)
                 nobs, r, done, back_s = env.step(a, back_s)
 
-                # New block? env._episodes_in_block becomes 1 on new block's first episode
                 if env._episodes_in_block == 1 and last_block_counter != 1:
                     backtest_session_id = f"bt-{int(time.time())}"
                     equity = float(env.e0)
@@ -558,7 +584,6 @@ def live_thread(stop: threading.Event):
                     log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(nobs[0,-1]), 0.0, 0.0, equity, "block start")
                 last_block_counter = env._episodes_in_block
 
-                # synthesize trade row
                 risk = float(back_obs[0, -1])
                 price = 100.0
                 notional = equity * risk
@@ -585,7 +610,6 @@ def live_thread(stop: threading.Event):
                 time.sleep(BACKTEST_POLL_SECONDS)
                 continue
 
-            # idle if neither live nor backtesting
             with STATE_LOCK:
                 STATE['status'] = STATE['mode'] = 'idle'
             time.sleep(5)
@@ -631,7 +655,6 @@ def metrics(_: None = Depends(require_key)):
 
 @app.get("/trades")
 def trades(limit: int = 100, cursor: int = 0, session: Optional[str] = None, _: None = Depends(require_key)):
-    # default: current session (so charts reset per day/block)
     if session is None:
         with STATE_LOCK:
             session = STATE.get("session_id", "bootstrap")
@@ -654,7 +677,6 @@ def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends
     if rows:
         series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None]
         return {"series": series[-2000:], "session": session}
-    # fallback so charts render even on fresh session
     with STATE_LOCK: eq = float(STATE.get("equity", 1000.0))
     now = now_utc()
     series = [{"t": (now - timedelta(minutes=m)).isoformat(), "equity": eq} for m in range(60, -1, -1)]
@@ -680,35 +702,31 @@ def seed(_: None = Depends(require_key)):
 
 @app.post("/snapshot")
 def snapshot(_: None = Depends(require_key)):
-    # ad-hoc checkpoint
     env, _ = build_env()
     n_inputs  = env.N_assets + 1
     n_actions = env.N_assets + 1
     agent = PPO(WINDOW, n_inputs, n_actions, PPO_CFG)
     if os.path.exists(MODEL_PATH):
         agent.net.load_state_dict(torch.load(MODEL_PATH, map_location='cpu'))
-    # note: this just copies latest; training thread writes actual improvements nightly
     ts = datetime.utcnow().strftime("%H%M%S")
     save_checkpoint(agent, f"manual-{ts}")
     return {"ok": True}
 
-# ---------- Admin hard reset (added) ----------
+# ---------- Admin hard reset ----------
 def hard_reset():
     with STATE_LOCK:
         STATE['status'] = STATE['mode'] = 'resetting'
-    # delete model file (forget training)
     try:
         if os.path.exists(MODEL_PATH):
             os.remove(MODEL_PATH)
     except Exception as e:
         print("Model delete error:", e)
-    # delete DB and recreate schema
     try:
         if os.path.exists(DB_PATH):
             os.remove(DB_PATH)
     except Exception as e:
         print("DB delete error:", e)
-    # reopen DB and reset state
+    # recreate empty DB
     global DB
     DB = db()
     with STATE_LOCK:
@@ -721,6 +739,8 @@ def hard_reset():
             "max_drawdown": 0.0,
             "session_id": "bootstrap"
         })
+    # signal worker to rebuild env/agent & sessions
+    REINIT_EVENT.set()
 
 class ResetReq(BaseModel):
     password: str
