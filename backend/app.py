@@ -100,11 +100,14 @@ def fetch_sp500() -> List[str]:
         pass
     return FALLBACK_TICKERS
 
+# --- keep this function the same ---
 def fetch_history(tickers: List[str], years: int) -> pd.DataFrame:
     end = now_utc()
     start = end - timedelta(days=int(years*365.25))
-    df = yf.download(tickers, start=start.date(), end=end.date(), progress=False, auto_adjust=True)["Close"]
-    if isinstance(df, pd.Series): df = df.to_frame()
+    df = yf.download(tickers, start=start.date(), end=end.date(),
+                     progress=False, auto_adjust=True)["Close"]
+    if isinstance(df, pd.Series):
+        df = df.to_frame()
     return df.dropna(how="all")
 
 # ================ ENV =================
@@ -114,13 +117,9 @@ class EpState:
     equity: float
 
 class Env:
-    """
-    Observation: [W, N_assets + 1]  (+1 column = episode risk)
-    Actions: N_assets + 1 (assets + CASH)
-    Reward: pnl / e0, where pnl = equity * risk * (r - fee)
-    """
-    def __init__(self, returns_df: pd.DataFrame, window: int, fee_bps: float):
-        self.R = returns_df.dropna(axis=1, how='all').values.astype(np.float32)  # [T, N_assets]
+    def __init__(self, returns_df: pd.DataFrame, prices_df: pd.DataFrame, window: int, fee_bps: float):
+        self.R = returns_df.dropna(axis=1, how='all').values.astype(np.float32)  # [T, N]
+        self.P = prices_df[self.tickers].values.astype(np.float32)               # [T, N]  <-- NEW
         self.tickers = list(returns_df.columns)
         self.N_assets = len(self.tickers)
         self.W = window
@@ -128,7 +127,7 @@ class Env:
         self.fee_bps = fee_bps
         self._obs_raw = self._build_obs_raw()
         self.valid = list(range(self.W, self.R.shape[0]-1))
-        # episode-block sampling (BACKTEST)
+        # episode-block sampling...
         self.block_episodes = EPISODE_BLOCK
         self._episodes_in_block = 0
         self._block_risk = self._sample_risk()
@@ -314,8 +313,10 @@ def build_env():
     tickers = fetch_sp500() if AUTO_FETCH_SP500 else FALLBACK_TICKERS
     prices = fetch_history(tickers, HISTORY_YEARS)
     rets = prices.pct_change().dropna(how='all')
-    env = Env(rets, WINDOW, FEE_BPS)
-    with STATE_LOCK: STATE['universe'] = env.N_assets
+    prices_aligned = prices.loc[rets.index]                    # NEW: align to returns index
+    env = Env(rets, prices_aligned, WINDOW, FEE_BPS)          # pass prices_aligned in
+    with STATE_LOCK:
+        STATE['universe'] = env.N_assets
     return env, tickers
 
 # ================ TRAINER =================
@@ -566,11 +567,26 @@ def live_thread(stop: threading.Event):
                         STATE['equity'] = equity
                         STATE['today_pnl'] = 0.0
                         STATE['today_trades'] = 0
-                    log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(back_obs[0,-1]), 0.0, 0.0, equity, "block start")
-
+                    log_trade_row(
+                        backtest_session_id, "BACKTEST", "HOLD", "CASH",
+                        0.0, 0.0, 0.0, FEE_BPS, float(back_obs[0, -1]),
+                        0.0, 0.0, equity, "block start"
+                    )
+            
+                # record current step index before acting (to fetch the matching price)
+                cur_t = back_s.t
                 a, lp, v = agent.act(back_obs)
+            
+                # real historical price for this asset at cur_t (if not CASH)
+                price = 0.0
+                if a != env.cash and a < env.N_assets:
+                    try:
+                        price = float(env.P[cur_t, a])
+                    except Exception:
+                        price = 0.0
+            
                 nobs, r, done, back_s = env.step(a, back_s)
-
+            
                 if env._episodes_in_block == 1 and last_block_counter != 1:
                     backtest_session_id = f"bt-{int(time.time())}"
                     equity = float(env.e0)
@@ -581,11 +597,14 @@ def live_thread(stop: threading.Event):
                         STATE['equity'] = equity
                         STATE['today_pnl'] = 0.0
                         STATE['today_trades'] = 0
-                    log_trade_row(backtest_session_id, "BACKTEST", "HOLD", "CASH", 0.0, 0.0, 0.0, FEE_BPS, float(nobs[0,-1]), 0.0, 0.0, equity, "block start")
+                    log_trade_row(
+                        backtest_session_id, "BACKTEST", "HOLD", "CASH",
+                        0.0, 0.0, 0.0, FEE_BPS, float(nobs[0, -1]),
+                        0.0, 0.0, equity, "block start"
+                    )
                 last_block_counter = env._episodes_in_block
-
+            
                 risk = float(back_obs[0, -1])
-                price = 100.0
                 notional = equity * risk
                 fee = notional * FEE_BPS
                 pnl = notional * r - fee
@@ -595,14 +614,18 @@ def live_thread(stop: threading.Event):
                 realized = pnl if side == 'SELL' else 0.0
                 realized_pct = (realized / notional) if notional > 0 else 0.0
                 ticker = tickers[a] if a != env.cash and a < len(tickers) else "CASH"
-                qty = notional / price if a != env.cash else 0.0
-                log_trade_row(backtest_session_id, "BACKTEST", side, ticker, qty, price, notional, FEE_BPS, risk, realized, realized_pct, equity, "backtest step")
+                qty = (notional / max(price, 1e-6)) if (a != env.cash and price > 0) else 0.0
+            
+                log_trade_row(
+                    backtest_session_id, "BACKTEST", side, ticker, qty, price,
+                    notional, FEE_BPS, risk, realized, realized_pct, equity, "backtest step"
+                )
                 with STATE_LOCK:
                     STATE['today_trades'] += 1
                     STATE['equity'] = float(equity)
                     STATE['today_pnl'] = float(STATE.get('today_pnl', 0.0) + pnl)
-                    STATE['max_drawdown'] = float(0.0 if peak_equity <= 0 else (peak_equity - equity)/peak_equity)
-
+                    STATE['max_drawdown'] = float(0.0 if peak_equity <= 0 else (peak_equity - equity) / peak_equity)
+            
                 back_obs = nobs
                 if done:
                     back_obs, back_s = env.reset()
