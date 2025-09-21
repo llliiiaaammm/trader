@@ -17,6 +17,29 @@ async function getJSON(path) {
   return await res.json();
 }
 
+async function postJSON(path, body) {
+  const headers = { "Content-Type": "application/json" };
+  if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
+  const res = await fetch(`${API_BASE}${path}`, {
+    method: "POST",
+    headers,
+    body: JSON.stringify(body || {})
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return await res.json();
+}
+
+document.getElementById("resetBtn")?.addEventListener("click", async () => {
+  try {
+    const pwd = prompt("Admin password to reset all model & trades:");
+    if (!pwd) return;
+    await postJSON("/admin/reset", { password: pwd });
+    alert("Reset complete. The service will start a new episode block.");
+  } catch (e) {
+    alert(`Reset failed: ${e.message}`);
+  }
+});
+
 const fmtUSD = n => (n>=0? "$"+n.toFixed(2) : "-$"+Math.abs(n).toFixed(2));
 
 let eqChart;
@@ -74,7 +97,7 @@ async function loadTrades() {
       <td>${new Date(r.ts_et || r.ts_utc).toLocaleString()}</td>
       <td>${r.side}</td>
       <td>${r.ticker}</td>
-      <td>${Number(r.qty||0).toFixed(4)}</td>
+      <td>${Number(r.qty||0).toFixed(6)}</td>
       <td>${Number(r.fill_price||0).toFixed(2)}</td>
       <td>${Number(r.notional||0).toFixed(2)}</td>
       <td>${Number(r.risk_frac||0).toFixed(3)}</td>
