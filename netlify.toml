@@ -1,11 +1,8 @@
-[build]
-  publish = "netlify/site"
-  functions = "netlify/functions"
-  command = ""
-
 [functions]
   directory = "netlify/functions"
+  node_bundler = "esbuild"   # safe default on Netlify
 
+# Proxy all /api/* to our function
 [[redirects]]
   from = "/api/*"
   to = "/.netlify/functions/proxy"
