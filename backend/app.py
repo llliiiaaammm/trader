@@ -394,29 +394,39 @@ REINIT_EVENT = threading.Event()
 
 # ================ BUILD ENV =================
 def build_env():
-    # Try to fetch; if anything goes wrong, fall back gracefully
+    # 1) pick tickers (prefer auto-fetch, but NEVER return empty)
+    tickers = FALLBACK_TICKERS
+    if AUTO_FETCH_SP500:
+        try:
+            got = fetch_sp500()
+            if isinstance(got, list) and len(got) >= 5:
+                tickers = got
+        except Exception:
+            pass  # keep fallback
+
+    # 2) get prices (fallback to small list, then synthetic if needed)
     try:
-        tickers = fetch_sp500() if AUTO_FETCH_SP500 else FALLBACK_TICKERS
+        prices = fetch_history(tickers, HISTORY_YEARS)
     except Exception:
-        tickers = FALLBACK_TICKERS
+        prices = None
 
-    # Ensure we always have something
-    if not tickers:
-        tickers = FALLBACK_TICKERS
-
-    prices = fetch_history(tickers, HISTORY_YEARS)
-
-    # If history came back empty, fall back again to the known small set
     if prices is None or prices.empty:
-        prices = fetch_history(FALLBACK_TICKERS, HISTORY_YEARS)
+        try:
+            prices = fetch_history(FALLBACK_TICKERS, HISTORY_YEARS)
+        except Exception:
+            prices = None
 
-    # Final guard: if still empty, make a tiny synthetic series to keep the loop alive
     if prices is None or prices.empty:
+        # last-ditch synthetic series so the engine always starts
         idx = pd.date_range(end=now_utc().date(), periods=365, freq="D")
         rng = pd.Series(np.random.normal(0, 0.01, size=len(idx))).cumsum()
-        prices = pd.DataFrame({"AAPL": 100 * (1 + rng/10)}, index=idx)
+        prices = pd.DataFrame({"AAPL": 100 * (1 + rng / 10)}, index=idx)
 
     rets = prices.pct_change().dropna(how="all")
+    # If something really odd happened, keep at least one column
+    if rets is None or rets.empty:
+        rets = pd.DataFrame({"AAPL": np.zeros(100)}, index=pd.date_range(end=now_utc().date(), periods=100))
+
     env = Env(rets, WINDOW, FEE_BPS)
     with STATE_LOCK:
         STATE['universe'] = env.N_assets
