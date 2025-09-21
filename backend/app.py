@@ -367,7 +367,7 @@ def trainer_thread(stop: threading.Event):
         if is_market_open(now_utc()) or not is_nightly(now_utc()):
             continue
         with STATE_LOCK: STATE['status']=STATE['mode']='training'
-        for _ in range(TRAIN_ROUNDS_PER_NIGHT'):
+        for _ in range(TRAIN_ROUNDS_PER_NIGHT):
             batch=rollout(env,agent,PPO_CFG['rollout_steps']); agent.update(batch)
         save_checkpoint(agent, "nightly")
         with STATE_LOCK: STATE['status']=STATE['mode']='idle'
