@@ -3,7 +3,10 @@
   functions = "netlify/functions"
   command = ""
 
+[functions]
+  directory = "netlify/functions"
+
 [[redirects]]
   from = "/api/*"
-  to = "/.netlify/functions/:splat"
+  to = "/.netlify/functions/proxy"
   status = 200
