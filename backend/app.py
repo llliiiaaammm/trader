@@ -14,6 +14,7 @@ from fastapi import FastAPI, Header, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi import Response
+from pydantic import BaseModel  # <-- added
 import uvicorn
 
 # ================ CONFIG =================
@@ -51,6 +52,9 @@ RISK_JITTER = float(os.getenv("RISK_JITTER", "0.05"))
 FEE_BPS = float(os.getenv("FEE_BPS", "0.0005"))
 MAX_LIVE_DRAWDOWN = float(os.getenv("MAX_LIVE_DRAWDOWN", "0.20"))  # 20% halt
 
+# Admin reset password (for /admin/reset)
+ADMIN_RESET_PASSWORD = os.getenv("ADMIN_RESET_PASSWORD", "liamb123abc")  # <-- added
+
 # Make sure folders exist
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
 os.makedirs(MODEL_DIR, exist_ok=True)
@@ -63,7 +67,7 @@ def is_market_open(ts: datetime) -> bool:
     et = ts.astimezone(pytz.timezone(MARKET_TZ))
     if et.weekday() >= 5: return False
     o = et.replace(hour=9, minute=30, second=0, microsecond=0)
-    c = et.replace(hour=16, minute=0, microsecond=0)
+    c = et.replace(hour=16, minute=0, second=0, microsecond=0)
     return o <= et <= c
 
 def is_nightly(ts: datetime) -> bool:
@@ -687,6 +691,46 @@ def snapshot(_: None = Depends(require_key)):
     ts = datetime.utcnow().strftime("%H%M%S")
     save_checkpoint(agent, f"manual-{ts}")
     return {"ok": True}
+
+# ---------- Admin hard reset (added) ----------
+def hard_reset():
+    with STATE_LOCK:
+        STATE['status'] = STATE['mode'] = 'resetting'
+    # delete model file (forget training)
+    try:
+        if os.path.exists(MODEL_PATH):
+            os.remove(MODEL_PATH)
+    except Exception as e:
+        print("Model delete error:", e)
+    # delete DB and recreate schema
+    try:
+        if os.path.exists(DB_PATH):
+            os.remove(DB_PATH)
+    except Exception as e:
+        print("DB delete error:", e)
+    # reopen DB and reset state
+    global DB
+    DB = db()
+    with STATE_LOCK:
+        STATE.update({
+            "status": "idle",
+            "mode": "idle",
+            "equity": 0.0,
+            "today_pnl": 0.0,
+            "today_trades": 0,
+            "max_drawdown": 0.0,
+            "session_id": "bootstrap"
+        })
+
+class ResetReq(BaseModel):
+    password: str
+
+@app.post("/admin/reset")
+def admin_reset(req: ResetReq, _: None = Depends(require_key)):
+    if req.password != ADMIN_RESET_PASSWORD:
+        raise HTTPException(403, detail="Bad admin password")
+    hard_reset()
+    return {"ok": True, "message": "Reset complete"}
 
 # ================ BOOT =================
 STOP = threading.Event()
