@@ -2,7 +2,9 @@
   directory = "netlify/functions"
   node_bundler = "esbuild"
 
+# Forward /api/* to the function WITH the path segment
 [[redirects]]
   from = "/api/*"
-  to = "/.netlify/functions/proxy"
+  to = "/.netlify/functions/proxy/:splat"
   status = 200
+  force = true
