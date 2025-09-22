@@ -1004,6 +1004,9 @@ def hard_reset():
             os.remove(DB_PATH)
     except Exception as e:
         print("DB delete error:", e)
+    with get_db() as conn:
+        conn.execute(SCHEMA_SQL)
+        conn.commit()
     # signal worker to rebuild env/agent & sessions (DB recreated lazily on first write)
     REINIT_EVENT.set()
     with STATE_LOCK:
