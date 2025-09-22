@@ -1,92 +1,70 @@
-console.log("DBG API_BASE bootstrap", { RAW_BASE: (window||{}).API_BASE, RAW_KEY: (window||{}).API_KEY });
+// All API calls go through Netlify proxy at /api/* (no secrets in browser)
+const API_BASE = "/api";
 
-// --- Base URL + auth (sanitized) ---
-const RAW_BASE = (typeof window !== "undefined" ? window.API_BASE : null);
-const API_BASE = (!RAW_BASE || RAW_BASE === "undefined" ? "/api" : RAW_BASE.trim().replace(/\/+$/, ""));
-const RAW_KEY  = (typeof window !== "undefined" ? window.API_KEY : null);
-const API_KEY  = (!RAW_KEY || RAW_KEY === "undefined" ? "" : RAW_KEY);
-
-// single, final getJSON
 async function getJSON(path) {
-  const headers = { "Content-Type": "application/json" };
-  if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
   const url = `${API_BASE}${path}`;
-  console.log("DBG fetch", { API_BASE, url, path });   // keep this log until fixed
-  const res = await fetch(url, { headers, cache: "no-store" });
+  // No Authorization header — Netlify function injects it
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return await res.json();
+  return res.json();
 }
 
 async function postJSON(path, body) {
-  const headers = { "Content-Type": "application/json" };
-  if (API_KEY) headers["Authorization"] = `Bearer ${API_KEY}`;
   const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
-    headers,
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
   });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-  return await res.json();
+  return res.json();
 }
 
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
+  const pwd = prompt("Admin password to reset all model & trades:");
+  if (!pwd) return;
   try {
-    const pwd = prompt("Admin password to reset all model & trades:");
-    if (!pwd) return;
     await postJSON("/admin/reset", { password: pwd });
-    alert("Reset complete. The service will start a new episode block.");
+    alert("Reset complete. Service will reinitialize.");
   } catch (e) {
     alert(`Reset failed: ${e.message}`);
   }
 });
 
-const fmtUSD = n => (n>=0? "$"+n.toFixed(2) : "-$"+Math.abs(n).toFixed(2));
+const fmtUSD = (n) => (Number(n) >= 0 ? `$${Number(n).toFixed(2)}` : `-$${Math.abs(Number(n)).toFixed(2)}`);
+const pct = (x) => `${(Number(x) * 100).toFixed(2)}%`;
 
 async function loadMetrics() {
   const m = await getJSON("/metrics");
+  // Backend exposes: mode/status/equity/cash/positions_value/unrealized_pnl/today_pnl/today_trades/universe/max_drawdown
   document.getElementById("mode").textContent = m.status || "idle";
-  document.getElementById("equity").textContent = fmtUSD(Number(m.equity||0));
-  document.getElementById("pnl").textContent = fmtUSD(Number(m.today_pnl||0));
-  document.getElementById("trades").textContent = Number(m.today_trades||0);
-  document.getElementById("universe").textContent = Number(m.universe||0);
-  document.getElementById("dd").textContent = ((Number(m.max_drawdown||0))*100).toFixed(2)+"%";
+  document.getElementById("equity").textContent = fmtUSD(m.equity || 0);
+  document.getElementById("pnl").textContent = fmtUSD(m.today_pnl || 0);
+  document.getElementById("trades").textContent = Number(m.today_trades || 0);
+
+  // New fields:
+  document.getElementById("cash").textContent = fmtUSD(m.cash || 0);
+  document.getElementById("invested").textContent = fmtUSD(m.positions_value || 0);
+  document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl || 0);
+
+  document.getElementById("universe").textContent = Number(m.universe || 0);
+  document.getElementById("dd").textContent = pct(m.max_drawdown || 0);
 }
 
 let eqChart;
-
 async function loadEquity() {
-  // API returns: { series: [{ t: ISO_STRING, equity: number }], session: "..." }
   const { series = [] } = await getJSON("/equity");
-
-  const points = series.map(p => ({
-    x: p.t,                 // ISO string is fine; adapter parses it
-    y: Number(p.equity)
-  }));
+  const points = series.map(p => ({ x: p.t, y: Number(p.equity) }));
 
   if (!eqChart) {
     const ctx = document.getElementById("equityChart").getContext("2d");
     eqChart = new Chart(ctx, {
       type: "line",
-      data: {
-        datasets: [{
-          label: "Equity",
-          data: points,
-          fill: false,
-          tension: 0.2,
-          pointRadius: 0
-        }]
-      },
+      data: { datasets: [{ label: "Equity", data: points, tension: 0.2, pointRadius: 0 }] },
       options: {
         animation: false,
-        parsing: true,      // enable {x,y} parsing
+        parsing: true,
         scales: {
-          x: {
-            type: "time",
-            time: {
-              unit: "minute",          // 'hour' or 'day' if you prefer
-              tooltipFormat: "MMM d, HH:mm"
-            }
-          },
+          x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" } },
           y: { beginAtZero: false }
         },
         plugins: { legend: { display: true } }
@@ -125,15 +103,28 @@ async function loadTrades() {
   }
 }
 
+// NEW: training stats (/api/stats)
+async function loadStats() {
+  const s = await getJSON("/stats");
+  const train = s.state || {};
+  const hist  = s.train || {};
+  const reward = train.train_reward_mean ?? hist.last_reward_mean ?? 0;
+  const win    = train.train_win_rate   ?? hist.last_win_rate   ?? 0;
+
+  document.getElementById("rewardMean").textContent = Number(reward).toFixed(4);
+  document.getElementById("winRate").textContent = `${(Number(win) * 100).toFixed(1)}%`;
+  if (hist.last_time_utc) {
+    document.getElementById("lastTrain").textContent = new Date(hist.last_time_utc).toLocaleString();
+  }
+}
+
 async function refresh() {
   try {
-    await Promise.all([loadMetrics(), loadEquity(), loadTrades()]);
+    await Promise.all([loadMetrics(), loadEquity(), loadTrades(), loadStats()]);
   } catch (e) {
-    // keep UI running even if API hiccups (e.g., 504 due to cold start)
-    console.warn(e);
+    console.warn("UI refresh error:", e.message);
   } finally {
     setTimeout(refresh, 5000);
   }
 }
-
 refresh();
