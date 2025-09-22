@@ -1,10 +1,7 @@
-// All API calls go through Netlify proxy at /api/* (no secrets in browser)
 const API_BASE = "/api";
 
 async function getJSON(path) {
-  const url = `${API_BASE}${path}`;
-  // No Authorization header — Netlify function injects it
-  const res = await fetch(url, { cache: "no-store" });
+  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
