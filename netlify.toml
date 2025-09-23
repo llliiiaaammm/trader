@@ -1,8 +1,6 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
-  # If your plan allows it, bump timeout to 26s:
-  timeout = 26
 
 [[redirects]]
   from = "/api/*"
