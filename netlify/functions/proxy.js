@@ -1,7 +1,7 @@
-// Proxies /api/* to your Render backend.
-// Netlify env (Site settings → Environment):
-//   BASE_URL = https://<your-render>.onrender.com
-//   API_KEY  = <same value as API_KEY on Render>
+// Proxies /api/* (Netlify site) -> Render backend (FastAPI)
+// Netlify env:
+//   BASE_URL = https://<your-render>.onrender.com  (no trailing slash)
+//   API_KEY  = same value as API_KEY on Render
 
 exports.handler = async (event) => {
   try {
@@ -11,20 +11,22 @@ exports.handler = async (event) => {
       return { statusCode: 500, body: "Missing BASE_URL or API_KEY" };
     }
 
-    // With the :splat redirect, event.path is "/.netlify/functions/proxy/<splat>"
-    const path = event.path.replace(/^\/\.netlify\/functions\/proxy/, "");
+    // Example event.path: "/.netlify/functions/proxy/api/metrics"
+    const rawPath = event.path.replace(/^\/\.netlify\/functions\/proxy/, ""); // -> "/api/metrics"
+    const cleanPath = rawPath.replace(/^\/api/, "") || "/";                   // -> "/metrics"
     const qs   = event.rawQuery ? `?${event.rawQuery}` : "";
-    const target = backend.replace(/\/+$/, "") + path + qs;
+    const target = backend.replace(/\/+$/, "") + cleanPath + qs;
 
-    // Forward headers (no host/auth), add Authorization
+    // Pass through headers (drop hop-by-hop), add Authorization
     const headers = {};
     for (const [k, v] of Object.entries(event.headers || {})) {
       const lk = k.toLowerCase();
-      if (lk !== "authorization" && lk !== "host") headers[k] = v;
+      if (lk !== "authorization" && lk !== "host" && lk !== "content-length" && lk !== "transfer-encoding") {
+        headers[k] = v;
+      }
     }
     headers["Authorization"]   = `Bearer ${apiKey}`;
-    headers["Host"]            = new URL(backend).host;
-    headers["Accept-Encoding"] = "identity"; // avoid compressed upstream body
+    headers["Accept-Encoding"] = "identity"; // avoid compressed upstream bodies
 
     const init = { method: event.httpMethod, headers };
     if (!["GET", "HEAD"].includes(event.httpMethod) && event.body) {
@@ -34,7 +36,7 @@ exports.handler = async (event) => {
     const upstream = await fetch(target, init);
     const text = await upstream.text();
 
-    // Strip hop-by-hop headers
+    // Return upstream status; strip compression-related headers
     const respHeaders = {};
     upstream.headers.forEach((v, k) => (respHeaders[k] = v));
     delete respHeaders["content-encoding"]; delete respHeaders["Content-Encoding"];
