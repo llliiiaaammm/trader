@@ -1,9 +1,10 @@
 [functions]
   directory = "netlify/functions"
   node_bundler = "esbuild"
+  # If your plan allows it, bump timeout to 26s:
+  timeout = 26
 
 [[redirects]]
   from = "/api/*"
-  to   = "/.netlify/functions/proxy/:splat"
+  to = "/.netlify/functions/proxy"
   status = 200
-  force = true
