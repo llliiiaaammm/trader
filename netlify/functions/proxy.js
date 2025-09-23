@@ -1,48 +1,54 @@
-// Proxies /api/* (Netlify site) -> Render backend (FastAPI)
-// Netlify env:
-//   BASE_URL = https://<your-render>.onrender.com  (no trailing slash)
-//   API_KEY  = same value as API_KEY on Render
-
+// netlify/functions/proxy.js
 exports.handler = async (event) => {
   try {
-    const backend = process.env.BASE_URL;
-    const apiKey  = process.env.API_KEY;
+    // Accept either name to avoid env drift
+    const backend =
+      process.env.BASE_URL ||
+      process.env.API_BASE_URL ||      // your current name in Netlify
+      process.env.VITE_API_BASE_URL || // just in case
+      "";
+
+    const apiKey =
+      process.env.API_KEY ||
+      process.env.VITE_API_KEY || "";
+
     if (!backend || !apiKey) {
-      return { statusCode: 500, body: "Missing BASE_URL or API_KEY" };
+      return {
+        statusCode: 500,
+        body: `Missing backend or apiKey. has_BASE_URL=${Boolean(process.env.BASE_URL)} has_API_BASE_URL=${Boolean(process.env.API_BASE_URL)} has_API_KEY=${Boolean(apiKey)}`
+      };
     }
 
-    // Example event.path: "/.netlify/functions/proxy/api/metrics"
-    const rawPath = event.path.replace(/^\/\.netlify\/functions\/proxy/, ""); // -> "/api/metrics"
-    const cleanPath = rawPath.replace(/^\/api/, "") || "/";                   // -> "/metrics"
-    const qs   = event.rawQuery ? `?${event.rawQuery}` : "";
-    const target = backend.replace(/\/+$/, "") + cleanPath + qs;
+    // Build URL
+    const pathNoApi = event.path.replace(/^\/api/, "");
+    const qs = event.rawQuery ? `?${event.rawQuery}` : "";
+    const target = backend.replace(/\/+$/, "") + pathNoApi + qs;
 
-    // Pass through headers (drop hop-by-hop), add Authorization
+    // Forward headers, strip host/authorization
     const headers = {};
     for (const [k, v] of Object.entries(event.headers || {})) {
       const lk = k.toLowerCase();
-      if (lk !== "authorization" && lk !== "host" && lk !== "content-length" && lk !== "transfer-encoding") {
-        headers[k] = v;
-      }
+      if (lk !== "host" && lk !== "authorization") headers[k] = v;
     }
     headers["Authorization"]   = `Bearer ${apiKey}`;
-    headers["Accept-Encoding"] = "identity"; // avoid compressed upstream bodies
+    headers["Host"]            = new URL(backend).host;
+    headers["Accept-Encoding"] = "identity"; // avoid gzipped upstream to simplify
 
     const init = { method: event.httpMethod, headers };
-    if (!["GET", "HEAD"].includes(event.httpMethod) && event.body) {
+    if (event.httpMethod !== "GET" && event.httpMethod !== "HEAD" && event.body) {
       init.body = event.isBase64Encoded ? Buffer.from(event.body, "base64") : event.body;
     }
 
     const upstream = await fetch(target, init);
-    const text = await upstream.text();
-
-    // Return upstream status; strip compression-related headers
+    const respText = await upstream.text();
     const respHeaders = {};
     upstream.headers.forEach((v, k) => (respHeaders[k] = v));
-    delete respHeaders["content-encoding"]; delete respHeaders["Content-Encoding"];
-    delete respHeaders["content-length"];   delete respHeaders["Content-Length"];
+    delete respHeaders["content-encoding"];
+    delete respHeaders["Content-Encoding"];
+    delete respHeaders["content-length"];
+    delete respHeaders["Content-Length"];
 
-    return { statusCode: upstream.status, headers: respHeaders, body: text };
+    return { statusCode: upstream.status, headers: respHeaders, body: respText };
   } catch (err) {
     return { statusCode: 502, body: `Proxy error: ${err}` };
   }
