@@ -1,4 +1,5 @@
 import os, math, json, time, random, threading, sqlite3, shutil, requests, pathlib
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -39,12 +40,12 @@ CHECKPOINT_POLL_SECS = int(os.getenv("CHECKPOINT_POLL_SECS", "60"))
 
 # Training data granularity
 TRAIN_INTERVAL = os.getenv("TRAIN_INTERVAL", "1d")  # '1d' or '1m'
-HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))            # used for 1d
-INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "30"))  # used for 1m
-WINDOW = int(os.getenv("WINDOW", "30"))   # lookback bars
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))
+INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "30"))
+WINDOW = int(os.getenv("WINDOW", "30"))
 AUTO_FETCH_SP500 = os.getenv("AUTO_FETCH_SP500", "true").lower() == "true"
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))               # backtest/training
-MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))     # live minute polling cap
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))
+MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))
 
 # Risk sizing
 EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))
@@ -55,12 +56,15 @@ RISK_MAX = float(os.getenv("RISK_MAX", "0.25"))
 RISK_JITTER = float(os.getenv("RISK_JITTER", "0.05"))
 
 # Trading frictions & safety
-FEE_BPS = float(os.getenv("FEE_BPS", "0.0005"))     # 5 bps
+FEE_BPS = float(os.getenv("FEE_BPS", "0.0005"))
 SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "0.0008"))
 MAX_LIVE_DRAWDOWN = float(os.getenv("MAX_LIVE_DRAWDOWN", "0.2"))
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 
-# Optional vendors (unused in this baseline but kept for future)
+# Benchmark line
+BENCH_SYMBOL = os.getenv("BENCH_SYMBOL", "SPY")
+
+# Optional vendors (reserved)
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
 FINNHUB_API_KEY  = os.getenv("FINNHUB_API_KEY", "")
 NEWSAPI_KEY      = os.getenv("NEWSAPI_KEY", "")
@@ -76,6 +80,15 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 # A lightweight lock to coordinate save/load of checkpoints across threads
 AGENT_LOCK = threading.Lock()
+
+# Pause switch & admin order queue
+PAUSED = threading.Event()
+class AdminOrder(BaseModel):
+    side: str             # BUY / SELL
+    ticker: str
+    notional: Optional[float] = None
+    qty: Optional[float] = None
+ADMIN_QUEUE: "deque[AdminOrder]" = deque()
 
 # ===================== TIME HELPERS =====================
 def now_utc() -> datetime:
@@ -178,7 +191,7 @@ def _rsi(closes: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     gain = (delta.clip(lower=0)).rolling(period).mean()
     loss = (-delta.clip(upper=0)).rolling(period).mean()
     rs = gain / (loss + 1e-12)
-    return 1 - (1 / (1 + rs))  # 0..1
+    return 1 - (1 / (1 + rs))
 
 def _vol_z(vols: pd.DataFrame, look: int = 20) -> Optional[pd.DataFrame]:
     if vols is None:
@@ -213,7 +226,6 @@ def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) 
     return closes, vols
 
 def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intraday_days: int = 30) -> HistoryBundle:
-    """Bounded, resilient fetch with simple tech features."""
     synthetic = False
     tickers = list(tickers)[:MAX_TICKERS] if tickers else list(FALLBACK_TICKERS)
 
@@ -246,7 +258,6 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
             pass
 
     # Synthetic fallback
-    synthetic = True
     idx = pd.date_range(end=now_utc().date(), periods=180, freq="D")
     synth = {}
     for s in (tickers[:20] or ["AAPL"]):
@@ -263,9 +274,7 @@ class EpState:
     equity: float
 
 class Env:
-    """Environment with multi-channel features, strict causality.
-       obs[t] -> W x (N * C + 1) where C is number of channels (returns + tech + slow features), +1 = risk column.
-    """
+    """obs[t] -> W x (N*C + 1), where +1 is risk column."""
     def __init__(self, bundle: HistoryBundle, window: int, fee_bps: float):
         closes = bundle.prices
         rets   = bundle.returns
@@ -278,9 +287,8 @@ class Env:
         self.cash_idx = self.N_assets
         self.fee_bps  = fee_bps
 
-        # Features per asset (align on returns index)
         idx = rets.index
-        chans = [rets.values.astype(np.float32)]  # returns
+        chans = [rets.values.astype(np.float32)]
         if bundle.ema_ratio is not None:
             er = bundle.ema_ratio[self.tickers].reindex(idx).diff().fillna(0.0).values.astype(np.float32)
             chans.append(er)
@@ -290,15 +298,14 @@ class Env:
         if bundle.vol_z is not None:
             vz = bundle.vol_z[self.tickers].reindex(idx).fillna(0.0).values.astype(np.float32)
             chans.append(vz)
+
         self.C = len(chans)
-        # Stack channels horizontally -> [T, N*C]
         self.X = np.concatenate(chans, axis=1)
         self.P = closes[self.tickers].reindex(idx).values.astype(np.float32)
-        # Build rolling windows
-        self.valid = list(range(self.W, self.X.shape[0]-1))
-        self._obs_raw = self._build_obs_raw()  # [T-W, W, N*C]
 
-        # episode-block sampling
+        self.valid = list(range(self.W, self.X.shape[0]-1))
+        self._obs_raw = self._build_obs_raw()
+
         self.block_episodes = EPISODE_BLOCK
         self._episodes_in_block = 0
         self._block_risk = self._sample_risk()
@@ -312,7 +319,7 @@ class Env:
 
     def _with_risk(self, raw: np.ndarray, risk: float) -> np.ndarray:
         risk_col = np.full((self.W, 1), float(risk), dtype=np.float32)
-        return np.concatenate([raw, risk_col], axis=1)  # [W, N*C+1]
+        return np.concatenate([raw, risk_col], axis=1)
 
     def _sample_risk(self) -> float:
         base = random.random()
@@ -347,7 +354,7 @@ class Env:
         next_t = t + 1
         if next_t >= self.X.shape[0]:
             return self._with_risk(self._obs_raw[t-self.W], self.risk), 0.0, True, s, 0.0, float(self.P[t,0])
-        realized_r = 0.0 if a == self.cash_idx else float(self.X[next_t, a % (self.N_assets)])  # first channel approx
+        realized_r = 0.0 if a == self.cash_idx else float(self.X[next_t, a % (self.N_assets)])
         pnl = (s.equity * self.risk) * (realized_r - self.fee_bps)
         eq = s.equity + pnl
         rew = pnl / self.e0
@@ -360,7 +367,6 @@ class Env:
 class Net(nn.Module):
     def __init__(self, input_dim: int, n_actions: int):
         super().__init__()
-        self.nA = n_actions
         self.body = nn.Sequential(
             nn.Flatten(),
             nn.Linear(input_dim, 256),
@@ -368,9 +374,8 @@ class Net(nn.Module):
             nn.Linear(256, 256),
             nn.ReLU(),
         )
-        self.pi = nn.Linear(256, self.nA)
+        self.pi = nn.Linear(256, n_actions)
         self.v  = nn.Linear(256, 1)
-
     def forward(self, x):
         z = self.body(x)
         return self.pi(z), self.v(z)
@@ -380,20 +385,17 @@ class PPO:
         self.net = Net(input_dim, n_actions)
         self.opt = optim.Adam(self.net.parameters(), lr=cfg['lr'])
         self.cfg = cfg
-
     @torch.no_grad()
     def act(self, obs):
-        x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)  # [1, W, F]
+        x = torch.tensor(obs, dtype=torch.float32).unsqueeze(0)
         logits, v = self.net(x)
         dist = torch.distributions.Categorical(logits=logits)
         a = dist.sample()
         return int(a.item()), dist.log_prob(a).item(), float(v.squeeze(0))
-
     def eval(self, obs, a):
         logits, v = self.net(obs)
         dist = torch.distributions.Categorical(logits=logits)
         return dist.log_prob(a), v.squeeze(-1), dist.entropy().mean()
-
     def update(self, batch):
         cfg = self.cfg; N = batch['obs'].size(0); idx = torch.randperm(N)
         for _ in range(cfg['epochs']):
@@ -419,7 +421,7 @@ PPO_CFG = {
 }
 
 def infer_input_dim(env: Env) -> int:
-    obs0, _ = env.reset(seed=0)           # [W, F]
+    obs0, _ = env.reset(seed=0)
     return int(obs0.shape[0] * obs0.shape[1])
 
 # ===================== SAMPLERS =====================
@@ -460,7 +462,6 @@ CREATE TABLE IF NOT EXISTS trades (
   reason TEXT
 );
 """
-
 TRAIN_SQL = """
 CREATE TABLE IF NOT EXISTS train_events (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -471,7 +472,6 @@ CREATE TABLE IF NOT EXISTS train_events (
   notes TEXT
 );
 """
-
 def get_db():
     conn = sqlite3.connect(DB_PATH, check_same_thread=True)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -492,10 +492,12 @@ STATE = {
     "max_drawdown": 0.0,
     "mode": "idle",
     "session_id": "bootstrap",
+    "block_risk": None,
+    "block_cash": None,
+    "paused": False,
 }
 STATE_LOCK = threading.Lock()
 REINIT_EVENT = threading.Event()
-
 TRAIN_STATS = {"last_reward_mean": 0.0, "last_win_rate": 0.0, "last_time_utc": None}
 
 # ===================== PORTFOLIO =====================
@@ -507,7 +509,6 @@ class Portfolio:
         self.equity = float(cash)
         self.realized_pnl = 0.0
         self.unrealized_pnl = 0.0
-
     def mark_to_market(self, prices: Dict[str, float]):
         upnl = 0.0
         inv = 0.0
@@ -517,13 +518,10 @@ class Portfolio:
             upnl += q * (p - cb)
             inv += q * p
         self.unrealized_pnl = upnl
-        self.equity = self.cash + inv + upnl - inv  # cash + (positions at CB) + upnl -> cash + MTM
+        self.equity = self.cash + inv + upnl - inv
         return self.equity
-
     def _apply_slippage(self, price: float, is_buy: bool) -> float:
-        bps = SLIPPAGE_BPS
-        return price * (1.0 + bps if is_buy else 1.0 - bps)
-
+        return price * (1.0 + SLIPPAGE_BPS if is_buy else 1.0 - SLIPPAGE_BPS)
     def trade_notional(self, ticker: str, notional: float, price: float, fees_bps: float) -> Tuple[float, float]:
         if price <= 0:
             return 0.0, 0.0
@@ -578,8 +576,7 @@ def rollout(env: Env, agent: PPO, steps: int):
         nobs, r, done, s, _, _ = env.step(a, s)
         obs_buf.append(obs); act_buf.append(a); logp_buf.append(lp); rew_buf.append(r); val_buf.append(v)
         obs = nobs
-        if done:
-            obs, s = env.reset()
+        if done: obs, s = env.reset()
     gamma=PPO_CFG['gamma']; lam=PPO_CFG['gae_lambda']
     rewards=np.array(rew_buf,dtype=np.float32); values=np.array(val_buf+[0.0],dtype=np.float32)
     adv=np.zeros_like(rewards); gae=0.0
@@ -598,7 +595,6 @@ def rollout(env: Env, agent: PPO, steps: int):
     return batch
 
 MODEL_PATH = os.path.join(MODEL_DIR, 'ppo.pt')
-
 def save_checkpoint(agent: PPO, tag: str):
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     ckpt = os.path.join(MODEL_DIR, f"ppo-{tag}-{ts}.pt")
@@ -611,12 +607,11 @@ def save_checkpoint(agent: PPO, tag: str):
 
 # ===================== TRAINER (continuous) =====================
 def trainer_thread(stop: threading.Event):
-    env, _, bundle = build_env()
+    env, _, _ = build_env()
     input_dim  = infer_input_dim(env)
     n_actions  = env.N_assets + 1
     agent = PPO(input_dim, n_actions, PPO_CFG)
 
-    # Warm load if exists (tolerate shape changes)
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location='cpu')
@@ -631,13 +626,15 @@ def trainer_thread(stop: threading.Event):
 
     while not stop.is_set():
         try:
+            if PAUSED.is_set():
+                with STATE_LOCK: STATE['status'] = 'paused'
+                time.sleep(1); continue
             if not CONTINUOUS_TRAIN:
-                time.sleep(5)
-                continue
-            # Small continuous updates
+                time.sleep(5); continue
+
             batch = rollout(env, agent, min(CONTINUOUS_ROLLOUT_STEPS, PPO_CFG['rollout_steps']))
             agent.update(batch)
-            # Track stats & save occasionally
+
             r = float(batch['ret'].mean().item())
             w = float((batch['ret']>0).float().mean().item())
             TRAIN_STATS.update({"last_reward_mean": r, "last_win_rate": w, "last_time_utc": now_utc().isoformat()})
@@ -647,11 +644,9 @@ def trainer_thread(stop: threading.Event):
                     (TRAIN_STATS['last_time_utc'], TRAIN_INTERVAL, r, w, "continuous"))
                 conn.commit()
             save_checkpoint(agent, "cont")
-            # Do not override UI mode; just keep stats
             time.sleep(CONTINUOUS_SLEEP_SECS)
         except Exception as e:
-            with STATE_LOCK:
-                STATE['status'] = f"train-error: {e}"
+            with STATE_LOCK: STATE['status'] = f"train-error: {e}"
             time.sleep(5)
 
 # ===================== LIVE / BACKTEST =====================
@@ -667,18 +662,16 @@ def insert_trade(row: Dict):
         conn.commit()
 
 def live_thread(stop: threading.Event):
-    env, tickers, bundle = build_env()
+    env, tickers, _ = build_env()
     input_dim  = infer_input_dim(env)
     n_actions  = env.N_assets + 1
     agent = PPO(input_dim, n_actions, PPO_CFG)
 
-    # Attempt to load the latest (tolerate shape changes)
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location='cpu')
             if isinstance(state, dict) and 'net' in state:
-                with AGENT_LOCK:
-                    agent.net.load_state_dict(state['net'], strict=False)
+                with AGENT_LOCK: agent.net.load_state_dict(state['net'], strict=False)
         except Exception:
             pass
 
@@ -710,13 +703,11 @@ def live_thread(stop: threading.Event):
         portfolio = Portfolio(cash=day_cash)
         last_prices = None; intraday_buf.clear()
         with STATE_LOCK:
-            STATE['session_id'] = live_session_id
-            STATE['equity'] = portfolio.equity
-            STATE['cash'] = portfolio.cash
-            STATE['positions_value'] = 0.0
-            STATE['unrealized_pnl'] = 0.0
-            STATE['today_pnl'] = 0.0
-            STATE['today_trades'] = 0
+            STATE.update({
+                'session_id': live_session_id, 'equity': portfolio.equity, 'cash': portfolio.cash,
+                'positions_value': 0.0, 'unrealized_pnl': 0.0, 'today_pnl': 0.0, 'today_trades': 0,
+                'block_risk': float(day_risk), 'block_cash': float(day_cash)
+            })
         et = now_utc().astimezone(tz)
         insert_trade({
             "session_id": live_session_id, "mode": "LIVE",
@@ -738,8 +729,7 @@ def live_thread(stop: threading.Event):
             prices_map = prices_to_map(last_prices)
         for t, q in list(portfolio.positions.items()):
             p = prices_map.get(t, 0.0)
-            if p <= 0:
-                continue
+            if p <= 0: continue
             notional = -q * p
             qty_exec, realized = portfolio.trade_notional(t, notional, p, FEE_BPS)
             et = now_utc().astimezone(tz)
@@ -767,8 +757,7 @@ def live_thread(stop: threading.Event):
             try:
                 state = torch.load(MODEL_PATH, map_location='cpu')
                 if isinstance(state, dict) and 'net' in state:
-                    with AGENT_LOCK:
-                        agent.net.load_state_dict(state['net'], strict=False)
+                    with AGENT_LOCK: agent.net.load_state_dict(state['net'], strict=False)
             except Exception:
                 pass
         today_et = now_utc().astimezone(tz).date()
@@ -778,12 +767,16 @@ def live_thread(stop: threading.Event):
             STATE.update({
                 "today_trades": 0, "today_pnl": 0.0, "max_drawdown": 0.0,
                 "session_id": "bootstrap", "equity": 0.0, "cash": 0.0,
-                "positions_value": 0.0, "unrealized_pnl": 0.0, "mode": "idle", "status": "idle"
+                "positions_value": 0.0, "unrealized_pnl": 0.0, "mode": "idle", "status": "idle",
+                "block_risk": None, "block_cash": None
             })
 
     while not stop.is_set():
         try:
-            # Hot-reload newest checkpoint occasionally
+            if PAUSED.is_set():
+                with STATE_LOCK: STATE['status'] = 'paused'
+                time.sleep(1); continue
+
             now_ts = time.time()
             if (now_ts - last_ckpt_check) >= CHECKPOINT_POLL_SECS:
                 last_ckpt_check = now_ts
@@ -792,8 +785,7 @@ def live_thread(stop: threading.Event):
                     if mtime > last_loaded_mtime:
                         state = torch.load(MODEL_PATH, map_location='cpu')
                         if isinstance(state, dict) and 'net' in state:
-                            with AGENT_LOCK:
-                                agent.net.load_state_dict(state['net'], strict=False)
+                            with AGENT_LOCK: agent.net.load_state_dict(state['net'], strict=False)
                             last_loaded_mtime = mtime
                 except Exception:
                     pass
@@ -811,6 +803,34 @@ def live_thread(stop: threading.Event):
                 with STATE_LOCK: STATE['status'] = STATE['mode'] = 'live'
                 if live_session_id is None:
                     start_live_session()
+
+                # Drain manual orders if any
+                if portfolio is not None and ADMIN_QUEUE:
+                    # fetch a fresh price snapshot
+                    live_names = tickers[:MAX_LIVE_TICKERS]
+                    snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True)
+                    closes = snap["Close"] if isinstance(snap.columns, pd.MultiIndex) else snap
+                    latest = closes.iloc[-1].dropna()
+                    while ADMIN_QUEUE:
+                        order = ADMIN_QUEUE.popleft()
+                        px = float(latest.get(order.ticker, np.nan))
+                        if not np.isnan(px) and px>0:
+                            notional = float(order.notional if order.notional is not None else 0.0)
+                            if order.qty is not None and notional == 0.0:
+                                notional = float(order.qty) * px * (1 if order.side.upper()=="BUY" else -1)
+                            qty_exec, realized = portfolio.trade_notional(order.ticker, notional, px, FEE_BPS)
+                            et = now_utc().astimezone(tz)
+                            insert_trade({
+                                "session_id": live_session_id, "mode": "LIVE",
+                                "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
+                                "side": order.side.upper(), "ticker": order.ticker,
+                                "qty": abs(qty_exec), "fill_price": px, "notional": abs(notional),
+                                "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS, "risk_frac": float(day_risk or 0.0),
+                                "position_before": 0.0, "position_after": float(portfolio.positions.get(order.ticker,0.0)),
+                                "cost_basis_before": 0.0, "cost_basis_after": float(portfolio.cost_basis.get(order.ticker,0.0)),
+                                "realized_pnl": realized, "realized_pnl_pct": 0.0,
+                                "equity_after": portfolio.equity, "reason": "admin manual order"
+                            })
 
                 # Drawdown gate
                 if portfolio and portfolio.equity > 0:
@@ -885,42 +905,70 @@ def live_thread(stop: threading.Event):
                     STATE['max_drawdown'] = float(dd)
                 time.sleep(POLL_SECONDS); continue
 
-            # Market closed: run light backtest loop to keep data + UI moving
+            # Market closed -> lightweight backtest loop
             if BACKTEST_WHEN_CLOSED:
                 with STATE_LOCK: STATE['status'] = STATE['mode'] = 'backtest'
-                back_obs, back_s = env.reset(); backtest_session_id = f"bt-{int(time.time())}"; eq = float(env.e0)
-                et = now_utc().astimezone(tz)
+                back_obs, back_s = env.reset(); backtest_session_id = f"bt-{int(time.time())}"
+                eq = float(env.e0)
+                block_risk = float(back_obs[0,-1])
+                with STATE_LOCK:
+                    STATE.update({'block_risk': block_risk, 'block_cash': float(eq)})
+                tznow = now_utc().astimezone(tz)
                 insert_trade({
                     "session_id": backtest_session_id, "mode": "BACKTEST",
-                    "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
+                    "ts_utc": now_utc().isoformat(), "ts_et": tznow.isoformat(),
                     "side": "HOLD", "ticker": "CASH", "qty": 0.0, "fill_price": 0.0,
                     "notional": 0.0, "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
-                    "risk_frac": float(back_obs[0,-1]), "position_before": 0.0, "position_after": 0.0,
+                    "risk_frac": block_risk, "position_before": 0.0, "position_after": 0.0,
                     "cost_basis_before": 0.0, "cost_basis_after": 0.0,
                     "realized_pnl": 0.0, "realized_pnl_pct": 0.0, "equity_after": eq, "reason": "block start"
                 })
                 with STATE_LOCK:
-                    STATE['session_id'] = backtest_session_id; STATE['equity'] = eq; STATE['today_trades'] = 0; STATE['today_pnl'] = 0.0
+                    STATE['session_id'] = backtest_session_id; STATE['equity'] = eq
+                    STATE['today_trades'] = 0; STATE['today_pnl'] = 0.0
+                    STATE['cash'] = float(eq); STATE['positions_value'] = 0.0; STATE['unrealized_pnl'] = 0.0
+
                 for _ in range(2000):
-                    a, lp, v = agent.act(back_obs)
-                    nobs, r, done, back_s, realized_r, exec_price = env.step(a, back_s)
-                    risk = float(back_obs[0,-1]); notional = eq * risk; fee = abs(notional) * FEE_BPS; pnl = notional * realized_r - fee; eq += pnl
+                    if PAUSED.is_set(): break
+                    a, _, _ = agent.act(back_obs)
+                    nobs, _, done, back_s, realized_r, exec_price = env.step(a, back_s)
+
+                    risk = float(back_obs[0,-1])
+                    notional = eq * risk
+                    fee = abs(notional) * FEE_BPS
+                    pnl = notional * realized_r - fee
+                    eq += pnl
+
                     ticker = env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"
                     qty = (abs(notional) / max(exec_price, 1e-6)) if ticker != "CASH" else 0.0
-                    et = now_utc().astimezone(tz)
+
+                    # For UI parity: show cash/invested this step
+                    positions_value = abs(notional) if ticker != "CASH" else 0.0
+                    cash = float(eq - positions_value)
+                    with STATE_LOCK:
+                        STATE['cash'] = cash
+                        STATE['positions_value'] = positions_value
+                        STATE['unrealized_pnl'] = 0.0  # closed each step
+                        STATE['equity'] = float(eq)
+
+                    tznow = now_utc().astimezone(tz)
                     insert_trade({
                         "session_id": backtest_session_id, "mode": "BACKTEST",
-                        "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
-                        "side": "MARK", "ticker": ticker, "qty": qty, "fill_price": exec_price,
+                        "ts_utc": now_utc().isoformat(), "ts_et": tznow.isoformat(),
+                        "side": "SIM", "ticker": ticker, "qty": qty, "fill_price": exec_price,
                         "notional": abs(notional), "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
                         "risk_frac": risk, "position_before": 0.0, "position_after": 0.0,
                         "cost_basis_before": 0.0, "cost_basis_after": 0.0,
                         "realized_pnl": pnl, "realized_pnl_pct": (pnl/abs(notional) if notional!=0 else 0.0),
-                        "equity_after": eq, "reason": "backtest step"
+                        "equity_after": eq, "reason": "simulated step"
                     })
+
                     with STATE_LOCK:
-                        STATE['today_trades'] += 1; STATE['equity'] = float(eq); STATE['today_pnl'] = float(STATE.get('today_pnl', 0.0) + pnl)
-                        peak_eq = max(STATE.get('peak_equity', eq), eq); STATE['peak_equity'] = peak_eq; STATE['max_drawdown'] = float(0.0 if peak_eq<=0 else (peak_eq - eq)/peak_eq)
+                        STATE['today_trades'] += 1
+                        STATE['today_pnl'] = float(STATE.get('today_pnl', 0.0) + pnl)
+                        peak_eq = max(STATE.get('peak_equity', eq), eq)
+                        STATE['peak_equity'] = peak_eq
+                        STATE['max_drawdown'] = float(0.0 if peak_eq<=0 else (peak_eq - eq)/peak_eq)
                     back_obs = nobs
                     if done: break
                     time.sleep(BACKTEST_POLL_SECONDS)
@@ -970,27 +1018,8 @@ def metrics(_: None = Depends(require_key)):
 @app.get("/stats")
 def stats(_: None = Depends(require_key)):
     with STATE_LOCK:
-        s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity")}
+        s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity","block_risk","block_cash","paused")}
     return {"train": TRAIN_STATS, "state": s}
-
-class TradesQuery(BaseModel):
-    limit: int = 100
-    cursor: int = 0
-    session: Optional[str] = None
-
-@app.get("/trades")
-def trades(limit: int = Query(100, ge=1, le=500), cursor: int = 0, session: Optional[str] = None, _: None = Depends(require_key)):
-    if session is None:
-        with STATE_LOCK:
-            session = STATE.get("session_id", "bootstrap")
-    with get_db() as conn:
-        cur = conn.execute(
-            "SELECT * FROM trades WHERE session_id=? AND trade_id>? ORDER BY trade_id DESC LIMIT ?",
-            (session, cursor, limit),
-        )
-        rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
-    next_cursor = rows[-1]["trade_id"] if rows else cursor
-    return {"data": rows, "next_cursor": next_cursor, "session": session}
 
 @app.get("/equity")
 def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends(require_key)):
@@ -1000,13 +1029,39 @@ def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends
     with get_db() as conn:
         cur = conn.execute("SELECT ts_utc, equity_after FROM trades WHERE session_id=? ORDER BY trade_id ASC", (session,))
         rows = cur.fetchall()
-    if rows:
-        series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None]
-        return {"series": series[-2000:], "session": session}
-    with STATE_LOCK: eq = float(STATE.get("equity", 1000.0))
-    now = now_utc()
-    series = [{"t": (now - timedelta(minutes=m)).isoformat(), "equity": eq} for m in range(60, -1, -1)]
-    return {"series": series, "session": session}
+    if not rows:
+        with STATE_LOCK: eq = float(STATE.get("equity", 1000.0))
+        now = now_utc()
+        series = [{"t": (now - timedelta(minutes=m)).isoformat(), "equity": eq} for m in range(60, -1, -1)]
+        return {"series": series, "bench": [], "session": session}
+
+    # Equity series
+    series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None][-2000:]
+
+    # Benchmark series (SPY by default) normalized to starting equity
+    try:
+        t0 = pd.to_datetime(series[0]["t"])
+        t1 = pd.to_datetime(series[-1]["t"])
+        span_days = max(1, (t1 - t0).days)
+        interval = "1m" if span_days <= 3 else "1d"
+        df = yf.download(BENCH_SYMBOL, start=t0.tz_localize(None), end=(t1 + pd.Timedelta(days=1)).tz_localize(None),
+                         interval=interval, auto_adjust=True, progress=False)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            px = df["Close"].dropna()
+            idx = pd.to_datetime([p["t"] for p in series])
+            aligned = px.reindex(idx, method="pad")
+            if not aligned.empty and aligned.iloc[0] > 0:
+                start_eq = float(series[0]["equity"])
+                bench_vals = start_eq * (aligned / aligned.iloc[0])
+                bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(idx, bench_vals)]
+            else:
+                bench = []
+        else:
+            bench = []
+    except Exception:
+        bench = []
+
+    return {"series": series, "bench": bench, "session": session}
 
 @app.post("/snapshot")
 def snapshot(_: None = Depends(require_key)):
@@ -1018,28 +1073,38 @@ def snapshot(_: None = Depends(require_key)):
         if os.path.exists(MODEL_PATH):
             state = torch.load(MODEL_PATH, map_location='cpu')
             if isinstance(state, dict) and 'net' in state:
-                with AGENT_LOCK:
-                    agent.net.load_state_dict(state['net'], strict=False)
+                with AGENT_LOCK: agent.net.load_state_dict(state['net'], strict=False)
         save_checkpoint(agent, f"manual-{ts}")
         return {"ok": True}
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# ---------- Admin hard reset ----------
+# ---------- Admin ----------
 class ResetReq(BaseModel):
     password: str
 
-def hard_reset():
-    with STATE_LOCK:
-        STATE['status'] = STATE['mode'] = 'resetting'
+class PauseReq(BaseModel):
+    password: str
+
+class TradeReq(BaseModel):
+    password: str
+    side: str
+    ticker: str
+    notional: Optional[float] = None
+    qty: Optional[float] = None
+
+@app.post("/admin/reset")
+def admin_reset(req: ResetReq, _: None = Depends(require_key)):
+    if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
+        raise HTTPException(403, detail="Bad admin password")
+    # hard reset
+    with STATE_LOCK: STATE['status'] = STATE['mode'] = 'resetting'
     try:
-        if os.path.exists(MODEL_PATH):
-            os.remove(MODEL_PATH)
+        if os.path.exists(MODEL_PATH): os.remove(MODEL_PATH)
     except Exception as e:
         print("Model delete error:", e)
     try:
-        if os.path.exists(DB_PATH):
-            os.remove(DB_PATH)
+        if os.path.exists(DB_PATH): os.remove(DB_PATH)
     except Exception as e:
         print("DB delete error:", e)
     with get_db() as conn:
@@ -1047,25 +1112,51 @@ def hard_reset():
     REINIT_EVENT.set()
     with STATE_LOCK:
         STATE.update({
-            "status": "idle",
-            "mode": "idle",
-            "equity": 0.0,
-            "cash": 0.0,
-            "positions_value": 0.0,
-            "unrealized_pnl": 0.0,
-            "today_pnl": 0.0,
-            "today_trades": 0,
-            "max_drawdown": 0.0,
-            "session_id": "bootstrap",
-            "peak_equity": 0.0
+            "status": "idle","mode": "idle","equity": 0.0,"cash": 0.0,"positions_value": 0.0,"unrealized_pnl": 0.0,
+            "today_pnl": 0.0,"today_trades": 0,"max_drawdown": 0.0,"session_id": "bootstrap","peak_equity": 0.0,
+            "block_risk": None, "block_cash": None
         })
+    return {"ok": True, "message": "Reset complete"}
 
-@app.post("/admin/reset")
-def admin_reset(req: ResetReq, _: None = Depends(require_key)):
+@app.post("/admin/pause")
+def admin_pause(req: PauseReq, _: None = Depends(require_key)):
     if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
-    hard_reset()
-    return {"ok": True, "message": "Reset complete"}
+    PAUSED.set()
+    with STATE_LOCK: STATE['paused'] = True; STATE['status'] = 'paused'
+    return {"ok": True, "paused": True}
+
+@app.post("/admin/resume")
+def admin_resume(req: PauseReq, _: None = Depends(require_key)):
+    if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
+        raise HTTPException(403, detail="Bad admin password")
+    PAUSED.clear()
+    with STATE_LOCK: STATE['paused'] = False
+    return {"ok": True, "paused": False}
+
+@app.post("/admin/trade")
+def admin_trade(req: TradeReq, _: None = Depends(require_key)):
+    if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
+        raise HTTPException(403, detail="Bad admin password")
+    side = req.side.upper()
+    if side not in ("BUY","SELL"):
+        raise HTTPException(400, detail="side must be BUY or SELL")
+    if not req.ticker: raise HTTPException(400, detail="ticker required")
+    ADMIN_QUEUE.append(AdminOrder(side=side, ticker=req.ticker.upper(), notional=req.notional, qty=req.qty))
+    return {"ok": True, "queued": True}
+
+@app.get("/admin/params")
+def admin_params(_: None = Depends(require_key)):
+    with STATE_LOCK:
+        dyn = {k: STATE.get(k) for k in ("mode","status","session_id","block_risk","block_cash","equity","cash","positions_value","unrealized_pnl","paused")}
+    cfg = {
+        "train_interval": TRAIN_INTERVAL, "history_years": HISTORY_YEARS, "intraday_period_days": INTRADAY_PERIOD_DAYS,
+        "window": WINDOW, "auto_fetch_sp500": AUTO_FETCH_SP500, "max_tickers": MAX_TICKERS, "max_live_tickers": MAX_LIVE_TICKERS,
+        "fee_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS, "allow_short": ALLOW_SHORT, "max_live_drawdown": MAX_LIVE_DRAWDOWN,
+        "episode_block": EPISODE_BLOCK, "start_cash_min": START_CASH_MIN, "start_cash_max": START_CASH_MAX,
+        "risk_min": RISK_MIN, "risk_max": RISK_MAX, "risk_jitter": RISK_JITTER, "bench_symbol": BENCH_SYMBOL
+    }
+    return {"dynamic": dyn, "config": cfg}
 
 # ===================== BOOT =====================
 STOP = threading.Event()
