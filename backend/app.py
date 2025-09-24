@@ -1,4 +1,5 @@
-import os, math, json, time, random, threading, sqlite3, shutil, requests
+# app.py
+import os, math, json, time, random, threading, sqlite3, shutil
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
@@ -16,9 +17,11 @@ from fastapi.responses import JSONResponse
 from fastapi import Response
 from pydantic import BaseModel
 import uvicorn
+import requests as _r
 
 # ===================== CONFIG =====================
 API_KEY = os.getenv("API_KEY", "changeme")
+ADMIN_RESET_PASSWORD = os.getenv("ADMIN_RESET_PASSWORD", "please-change-me")
 CORS_ORIGIN = os.getenv("CORS_ORIGIN", "*")
 
 MODEL_DIR = os.getenv("MODEL_DIR", "/data/models")
@@ -31,16 +34,15 @@ POLL_SECONDS = int(os.getenv("POLL_SECONDS", "60"))
 BACKTEST_POLL_SECONDS = int(os.getenv("BACKTEST_POLL_SECONDS", "5"))
 BACKTEST_WHEN_CLOSED = os.getenv("BACKTEST_WHEN_CLOSED", "true").lower() == "true"
 
-# Training
-NIGHTLY_TRAIN_ET = os.getenv("NIGHTLY_TRAIN_ET", "22:00")
-TRAIN_ROUNDS_PER_NIGHT = int(os.getenv("TRAIN_ROUNDS_PER_NIGHT", "4"))
+# Training (now always-on)
 TRAIN_INTERVAL = os.getenv("TRAIN_INTERVAL", "1d")  # '1d' or '1m'
-HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))  # used for 1d
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))     # used for 1d
 INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "30"))  # used for 1m
 WINDOW = int(os.getenv("WINDOW", "30"))   # lookback bars
 AUTO_FETCH_SP500 = os.getenv("AUTO_FETCH_SP500", "true").lower() == "true"
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))               # backtest/training
-MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))      # live minute polling cap
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))               # offline/backtest
+MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))     # live minute polling cap
+TRAIN_SAVE_EVERY_UPDATES = int(os.getenv("TRAIN_SAVE_EVERY_UPDATES", "4"))  # checkpoint cadence
 
 # Risk sizing
 EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))
@@ -56,15 +58,8 @@ SLIPPAGE_BPS = float(os.getenv("SLIPPAGE_BPS", "0.0008"))
 MAX_LIVE_DRAWDOWN = float(os.getenv("MAX_LIVE_DRAWDOWN", "0.2"))
 ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 
-# Optional vendors (live minute data & features)
-POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
-FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")  # optional fundamentals/news
-NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")          # optional news
-
-# Feature flags
+# Feature flags (tech features are on; fundamentals/news are optional and omitted to avoid API stalls)
 INCLUDE_TECH_FEATURES = os.getenv("INCLUDE_TECH_FEATURES", "true").lower() == "true"
-INCLUDE_FUNDAMENTALS  = os.getenv("INCLUDE_FUNDAMENTALS", "false").lower() == "true"
-INCLUDE_NEWS          = os.getenv("INCLUDE_NEWS", "false").lower() == "true"
 
 # Ensure folders exist
 os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
@@ -82,20 +77,14 @@ def is_market_open(ts: datetime) -> bool:
     c = et.replace(hour=16, minute=0, second=0, microsecond=0)
     return o <= et <= c
 
-def is_nightly(ts: datetime) -> bool:
-    et = ts.astimezone(pytz.timezone(MARKET_TZ))
-    hh, mm = map(int, NIGHTLY_TRAIN_ET.split(":"))
-    start = et.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    end = start + timedelta(hours=2)
-    return start <= et <= end
-
 # ===================== DATA =====================
 FALLBACK_TICKERS = [
     "AAPL","MSFT","AMZN","GOOGL","META","NVDA","BRK-B","JPM","XOM","UNH",
     "V","MA","HD","PG","AVGO","LLY","JNJ","TSLA","COST","MRK"
 ]
 
-SP500_CACHE = "/data/sp500.json"; SP500_TTL = 24 * 3600
+SP500_CACHE = "/data/sp500.json"
+SP500_TTL = 24 * 3600
 
 def _load_sp500_cache() -> Optional[List[str]]:
     try:
@@ -114,8 +103,6 @@ def _save_sp500_cache(tickers: List[str]) -> None:
             json.dump({"ts": time.time(), "tickers": tickers}, f)
     except Exception:
         pass
-
-import requests as _r
 
 def fetch_sp500() -> List[str]:
     cached = _load_sp500_cache()
@@ -168,7 +155,7 @@ def fetch_sp500() -> List[str]:
     _save_sp500_cache(tickers)
     return tickers
 
-# -------- Feature engineering helpers --------
+# -------- Tech features --------
 def _ema_ratio(closes: pd.DataFrame, fast: int = 10, slow: int = 50) -> pd.DataFrame:
     e1 = closes.ewm(span=fast, adjust=False).mean()
     e2 = closes.ewm(span=slow, adjust=False).mean()
@@ -196,8 +183,6 @@ class HistoryBundle:
     vol_z: Optional[pd.DataFrame]
     synthetic: bool
 
-# Generic chunked downloader for daily bars
-
 def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
     frames_p, frames_v = [], []
     for i in range(0, len(tickers), 100):
@@ -205,23 +190,22 @@ def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) 
         dfi = yf.download(chunk, start=start, end=end, interval="1d", auto_adjust=True,
                           progress=False, group_by="column", threads=True)
         if isinstance(dfi.columns, pd.MultiIndex):
-            frames_p.append(dfi["Close"]) ; frames_v.append(dfi.get("Volume"))
+            frames_p.append(dfi["Close"]); frames_v.append(dfi.get("Volume"))
         else:
-            frames_p.append(dfi) ; frames_v.append(None)
+            frames_p.append(dfi); frames_v.append(None)
     closes = pd.concat(frames_p, axis=1)
     vols = None
     if any(frames_v):
         vols = pd.concat([f for f in frames_v if f is not None], axis=1)
     return closes, vols
 
-
 def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intraday_days: int = 30) -> HistoryBundle:
-    """Bounded, resilient fetch with simple tech features."""
     synthetic = False
     tickers = list(tickers)[:MAX_TICKERS] if tickers else list(FALLBACK_TICKERS)
 
     if interval == "1d":
-        end = now_utc().date(); start = end - timedelta(days=365 * max(1, min(int(years), 10)))
+        end = now_utc().date()
+        start = end - timedelta(days=365 * max(1, min(int(years), 10)))
         try:
             closes, vols = _download_daily_chunked(tickers, start, end)
             closes = closes.dropna(how="all").loc[:, sorted([c for c in closes.columns if closes[c].notna().any()])]
@@ -233,11 +217,11 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
                 return HistoryBundle(closes, rets, list(closes.columns), er, rsi, vz, synthetic=False)
         except Exception:
             pass
-    else:  # 1m intraday
+    else:
         try:
             period = f"{max(5, min(60, int(intraday_days)))}d"
-            dfi = yf.download(tickers[:min(MAX_TICKERS, 100)], period=period, interval="1m", auto_adjust=True,
-                              progress=False, group_by="column", threads=True)
+            dfi = yf.download(tickers[:min(MAX_TICKERS, 100)], period=period, interval="1m",
+                              auto_adjust=True, progress=False, group_by="column", threads=True)
             closes = dfi["Close"] if isinstance(dfi.columns, pd.MultiIndex) else dfi
             closes = closes.dropna(how="all")
             rets = closes.pct_change().dropna(how="all")
@@ -249,7 +233,6 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
             pass
 
     # Synthetic fallback
-    synthetic = True
     idx = pd.date_range(end=now_utc().date(), periods=180, freq="D")
     synth = {}
     for s in (tickers[:20] or ["AAPL"]):
@@ -266,9 +249,7 @@ class EpState:
     equity: float
 
 class Env:
-    """Environment with multi-channel features, strict causality.
-       obs[t] -> W x (N * C + 1) where C is number of channels (returns + tech + slow features), +1 = risk column.
-    """
+    """Multi-channel features + strict causality. obs[t] -> W x (N*C + 1), +1=risk."""
     def __init__(self, bundle: HistoryBundle, window: int, fee_bps: float):
         closes = bundle.prices
         rets   = bundle.returns
@@ -281,9 +262,8 @@ class Env:
         self.cash_idx = self.N_assets
         self.fee_bps  = fee_bps
 
-        # Features per asset (align on returns index)
         idx = rets.index
-        chans = [rets.values.astype(np.float32)]  # returns
+        chans = [rets.values.astype(np.float32)]
         if bundle.ema_ratio is not None:
             er = bundle.ema_ratio[self.tickers].reindex(idx).diff().fillna(0.0).values.astype(np.float32)
             chans.append(er)
@@ -293,15 +273,13 @@ class Env:
         if bundle.vol_z is not None:
             vz = bundle.vol_z[self.tickers].reindex(idx).fillna(0.0).values.astype(np.float32)
             chans.append(vz)
-        self.C = len(chans)
-        # Stack channels horizontally -> [T, N*C]
-        self.X = np.concatenate(chans, axis=1)
-        self.P = closes[self.tickers].reindex(idx).values.astype(np.float32)
-        # Build rolling windows
-        self.valid = list(range(self.W, self.X.shape[0]-1))
-        self._obs_raw = self._build_obs_raw()  # [T-W, W, N*C]
 
-        # episode-block sampling
+        self.C = len(chans)
+        self.X = np.concatenate(chans, axis=1)    # [T, N*C]
+        self.P = closes[self.tickers].reindex(idx).values.astype(np.float32)
+        self.valid = list(range(self.W, self.X.shape[0]-1))
+        self._obs_raw = self._build_obs_raw()
+
         self.block_episodes = EPISODE_BLOCK
         self._episodes_in_block = 0
         self._block_risk = self._sample_risk()
@@ -315,7 +293,7 @@ class Env:
 
     def _with_risk(self, raw: np.ndarray, risk: float) -> np.ndarray:
         risk_col = np.full((self.W, 1), float(risk), dtype=np.float32)
-        return np.concatenate([raw, np.repeat(risk_col, repeats=1, axis=1)], axis=1)  # [W, N*C+1]
+        return np.concatenate([raw, risk_col], axis=1)  # [W, N*C+1]
 
     def _sample_risk(self) -> float:
         base = random.random()
@@ -350,7 +328,7 @@ class Env:
         next_t = t + 1
         if next_t >= self.X.shape[0]:
             return self._with_risk(self._obs_raw[t-self.W], self.risk), 0.0, True, s, 0.0, float(self.P[t,0])
-        realized_r = 0.0 if a == self.cash_idx else float(self.X[next_t, a % (self.N_assets)])  # first channel approx
+        realized_r = 0.0 if a == self.cash_idx else float(self.X[next_t, a % (self.N_assets)])
         pnl = (s.equity * self.risk) * (realized_r - self.fee_bps)
         eq = s.equity + pnl
         rew = pnl / self.e0
@@ -487,6 +465,10 @@ STATE = {
     "max_drawdown": 0.0,
     "mode": "idle",
     "session_id": "bootstrap",
+    # training stats mirrored here for UI
+    "train_reward_mean": 0.0,
+    "train_win_rate": 0.0,
+    "last_train_utc": None,
 }
 STATE_LOCK = threading.Lock()
 REINIT_EVENT = threading.Event()
@@ -512,7 +494,8 @@ class Portfolio:
             upnl += q * (p - cb)
             inv += q * p
         self.unrealized_pnl = upnl
-        self.equity = self.cash + inv + upnl - inv  # cash + (positions at CB) + upnl -> cash + MTM
+        # equity = cash + (positions at market) = cash + inv
+        self.equity = self.cash + inv
         return self.equity
 
     def _apply_slippage(self, price: float, is_buy: bool) -> float:
@@ -527,8 +510,10 @@ class Portfolio:
         qty = notional / px
         fee = abs(notional) * fees_bps
         realized = 0.0
+
         prev_qty = self.positions.get(ticker, 0.0)
         prev_cb  = self.cost_basis.get(ticker, 0.0)
+
         if is_buy:
             new_qty = prev_qty + qty
             new_cb = (prev_cb * prev_qty + px * qty) / new_qty if new_qty != 0 else 0.0
@@ -545,6 +530,7 @@ class Portfolio:
                 if self.positions[ticker] == 0:
                     self.cost_basis[ticker] = 0.0
                 self.cash += (exec_qty * px) - fee
+
         self.realized_pnl += realized
         return (qty if is_buy else -min(abs(qty), prev_qty)), realized
 
@@ -564,90 +550,103 @@ def build_env() -> Tuple[Env, List[str], HistoryBundle]:
         STATE["universe"] = env.N_assets
     return env, list(env.tickers), bundle
 
-# ===================== TRAINER =====================
+# ===================== TRAINER (ALWAYS-ON OFFLINE) =====================
 def rollout(env: Env, agent: PPO, steps: int):
-    obs_buf, act_buf, logp_buf, rew_buf, val_buf = [],[],[],[],[]
+    obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
     obs, s = env.reset()
     for _ in range(steps):
         a, lp, v = agent.act(obs)
         nobs, r, done, s, _, _ = env.step(a, s)
         obs_buf.append(obs); act_buf.append(a); logp_buf.append(lp); rew_buf.append(r); val_buf.append(v)
         obs = nobs
-        if done: obs, s = env.reset()
-    gamma=PPO_CFG['gamma']; lam=PPO_CFG['gae_lambda']
-    rewards=np.array(rew_buf,dtype=np.float32); values=np.array(val_buf+[0.0],dtype=np.float32)
-    adv=np.zeros_like(rewards); gae=0.0
+        if done:
+            obs, s = env.reset()
+    gamma = PPO_CFG['gamma']; lam = PPO_CFG['gae_lambda']
+    rewards = np.array(rew_buf, dtype=np.float32)
+    values = np.array(val_buf + [0.0], dtype=np.float32)
+    adv = np.zeros_like(rewards); gae = 0.0
     for t in reversed(range(len(rewards))):
-        delta=rewards[t]+gamma*values[t+1]-values[t]
-        gae=delta+gamma*lam*gae; adv[t]=gae
-    ret=values[:-1]+adv
-    adv=(adv-adv.mean())/(adv.std()+1e-8)
-    batch={
-        'obs':torch.tensor(np.array(obs_buf),dtype=torch.float32),
-        'actions':torch.tensor(np.array(act_buf),dtype=torch.long),
-        'logp':torch.tensor(np.array(logp_buf),dtype=torch.float32),
-        'ret':torch.tensor(ret,dtype=torch.float32),
-        'adv':torch.tensor(adv,dtype=torch.float32)
+        delta = rewards[t] + gamma * values[t+1] - values[t]
+        gae = delta + gamma * lam * gae
+        adv[t] = gae
+    ret = values[:-1] + adv
+    adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+    batch = {
+        'obs': torch.tensor(np.array(obs_buf), dtype=torch.float32),
+        'actions': torch.tensor(np.array(act_buf), dtype=torch.long),
+        'logp': torch.tensor(np.array(logp_buf), dtype=torch.float32),
+        'ret': torch.tensor(ret, dtype=torch.float32),
+        'adv': torch.tensor(adv, dtype=torch.float32)
     }
-    return batch
+    return batch, float(ret.mean()), float((ret > 0).astype(np.float32).mean())
 
 MODEL_PATH = os.path.join(MODEL_DIR, 'ppo.pt')
 
-def save_checkpoint(agent: PPO, tag: str):
+def save_checkpoint(agent: PPO, tag: str, stats: Optional[dict] = None):
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     ckpt = os.path.join(MODEL_DIR, f"ppo-{tag}-{ts}.pt")
     tmp  = os.path.join(MODEL_DIR, f"ppo-tmp.pt")
-    torch.save({"net": agent.net.state_dict(), "opt": agent.opt.state_dict(), "cfg": agent.cfg, "stats": TRAIN_STATS}, tmp)
+    payload = {"net": agent.net.state_dict(), "opt": agent.opt.state_dict(), "cfg": agent.cfg}
+    if stats:
+        payload["stats"] = stats
+    torch.save(payload, tmp)
     shutil.copy2(tmp, ckpt)
     shutil.copy2(tmp, MODEL_PATH)
 
-
 def trainer_thread(stop: threading.Event):
     env, _, bundle = build_env()
-    n_inputs  = env.X.shape[1] + 1  # risk column
+    n_inputs  = env._obs_raw.shape[-1] + 0  # already includes risk
     n_actions = env.N_assets + 1
     agent = PPO(WINDOW, n_inputs, n_actions, PPO_CFG)
+
     if os.path.exists(MODEL_PATH):
         try:
             state = torch.load(MODEL_PATH, map_location='cpu')
             if isinstance(state, dict) and 'net' in state:
                 agent.net.load_state_dict(state['net'])
-                try:
-                    agent.opt.load_state_dict(state.get('opt', {}))
-                except Exception:
-                    pass
+                try: agent.opt.load_state_dict(state.get('opt', {}))
+                except Exception: pass
         except Exception:
             pass
-    while not stop.is_set():
-        time.sleep(3)
-        if is_market_open(now_utc()) or not is_nightly(now_utc()) or bundle.synthetic:
-            continue
-        with STATE_LOCK:
-            STATE['status']=STATE['mode']='training'
-        reward_means=[]; win_rates=[]
-        for _ in range(TRAIN_ROUNDS_PER_NIGHT):
-            batch=rollout(env,agent,PPO_CFG['rollout_steps']); agent.update(batch)
-            r = float(batch['ret'].mean().item())
-            w = float((batch['ret']>0).float().mean().item())
-            reward_means.append(r); win_rates.append(w)
-        TRAIN_STATS.update({"last_reward_mean": float(np.mean(reward_means)), "last_win_rate": float(np.mean(win_rates)), "last_time_utc": now_utc().isoformat()})
-        with get_db() as conn:
-            conn.execute("INSERT INTO train_events(ts_utc, interval, reward_mean, win_rate, notes) VALUES (?,?,?,?,?)",
-                         (TRAIN_STATS['last_time_utc'], TRAIN_INTERVAL, TRAIN_STATS['last_reward_mean'], TRAIN_STATS['last_win_rate'], "nightly"))
-            conn.commit()
-        save_checkpoint(agent, "nightly")
-        with STATE_LOCK:
-            STATE['train_reward_mean'] = TRAIN_STATS['last_reward_mean']
-            STATE['train_win_rate'] = TRAIN_STATS['last_win_rate']
-            STATE['last_train_utc'] = TRAIN_STATS['last_time_utc']
-            STATE['status']=STATE['mode']='idle'
 
-# ===================== LIVE / BACKTEST =====================
+    updates_since_save = 0
+    while not stop.is_set():
+        try:
+            batch, r_mean, win_rate = rollout(env, agent, PPO_CFG['rollout_steps'])
+            agent.update(batch)
+            TRAIN_STATS.update({
+                "last_reward_mean": float(r_mean),
+                "last_win_rate": float(win_rate),
+                "last_time_utc": now_utc().isoformat()
+            })
+            with get_db() as conn:
+                conn.execute(
+                    "INSERT INTO train_events(ts_utc, interval, reward_mean, win_rate, notes) VALUES (?,?,?,?,?)",
+                    (TRAIN_STATS['last_time_utc'], TRAIN_INTERVAL, TRAIN_STATS['last_reward_mean'], TRAIN_STATS['last_win_rate'], "continuous")
+                )
+                conn.commit()
+            with STATE_LOCK:
+                STATE['train_reward_mean'] = TRAIN_STATS['last_reward_mean']
+                STATE['train_win_rate'] = TRAIN_STATS['last_win_rate']
+                STATE['last_train_utc'] = TRAIN_STATS['last_time_utc']
+
+            updates_since_save += 1
+            if updates_since_save >= TRAIN_SAVE_EVERY_UPDATES:
+                save_checkpoint(agent, "auto", stats=TRAIN_STATS)
+                updates_since_save = 0
+
+            time.sleep(1)  # small breather to avoid pegging CPU
+        except Exception as e:
+            # Don’t flip UI mode; just log to state
+            with STATE_LOCK:
+                STATE['status'] = f"train-error: {e}"
+            time.sleep(2)
+
+# ===================== LIVE / BACKTEST ENGINE =====================
 class PendingDecision:
     def __init__(self):
         self.action: Optional[int] = None
         self.risk: float = 0.0
-
 
 def insert_trade(row: Dict):
     with get_db() as conn:
@@ -655,19 +654,26 @@ def insert_trade(row: Dict):
         conn.execute(f"INSERT INTO trades ({cols}) VALUES ({ph})", list(row.values()))
         conn.commit()
 
-
 def live_thread(stop: threading.Event):
     env, tickers, bundle = build_env()
-    n_inputs  = env.X.shape[1] + 1
+    n_inputs  = env._obs_raw.shape[-1]
     n_actions = env.N_assets + 1
     agent = PPO(WINDOW, n_inputs, n_actions, PPO_CFG)
-    if os.path.exists(MODEL_PATH):
+
+    # Load latest policy if present
+    def load_policy_if_available():
         try:
-            state = torch.load(MODEL_PATH, map_location='cpu')
-            if isinstance(state, dict) and 'net' in state:
-                agent.net.load_state_dict(state['net'])
+            if os.path.exists(MODEL_PATH):
+                state = torch.load(MODEL_PATH, map_location='cpu')
+                if isinstance(state, dict) and 'net' in state:
+                    agent.net.load_state_dict(state['net'])
+                    return True
         except Exception:
             pass
+        return False
+
+    load_policy_if_available()
+    last_model_mtime = os.path.getmtime(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
 
     tz = pytz.timezone(MARKET_TZ)
     today_et = now_utc().astimezone(tz).date()
@@ -701,6 +707,8 @@ def live_thread(stop: threading.Event):
             STATE['unrealized_pnl'] = 0.0
             STATE['today_pnl'] = 0.0
             STATE['today_trades'] = 0
+            STATE['mode'] = 'live'
+            STATE['status'] = 'live'
         et = now_utc().astimezone(tz)
         insert_trade({
             "session_id": live_session_id, "mode": "LIVE",
@@ -742,18 +750,13 @@ def live_thread(stop: threading.Event):
     def do_full_reinit():
         nonlocal env, tickers, n_inputs, n_actions, agent
         nonlocal portfolio, day_risk, day_cash, live_session_id
-        nonlocal last_prices, intraday_buf, decision, today_et
+        nonlocal last_prices, intraday_buf, decision, today_et, last_model_mtime
         env, tickers, _ = build_env()
-        n_inputs  = env.X.shape[1] + 1
+        n_inputs  = env._obs_raw.shape[-1]
         n_actions = env.N_assets + 1
         agent = PPO(WINDOW, n_inputs, n_actions, PPO_CFG)
-        if os.path.exists(MODEL_PATH):
-            try:
-                state = torch.load(MODEL_PATH, map_location='cpu')
-                if isinstance(state, dict) and 'net' in state:
-                    agent.net.load_state_dict(state['net'])
-            except Exception:
-                pass
+        load_policy_if_available()
+        last_model_mtime = os.path.getmtime(MODEL_PATH) if os.path.exists(MODEL_PATH) else 0
         today_et = now_utc().astimezone(tz).date()
         portfolio = None; day_risk = day_cash = None; live_session_id = None
         last_prices = None; intraday_buf = []; decision = PendingDecision()
@@ -766,11 +769,20 @@ def live_thread(stop: threading.Event):
 
     while not stop.is_set():
         try:
+            # Hot-reload policy if trainer saved a new checkpoint
+            if os.path.exists(MODEL_PATH):
+                mt = os.path.getmtime(MODEL_PATH)
+                if mt > last_model_mtime:
+                    load_policy_if_available()
+                    last_model_mtime = mt
+
             if REINIT_EVENT.is_set():
                 do_full_reinit(); REINIT_EVENT.clear(); time.sleep(0.5); continue
+
             et_now = now_utc().astimezone(tz)
             if et_now.date() != today_et:
                 today_et = et_now.date(); day_risk = day_cash = None; portfolio = None; live_session_id = None; decision = PendingDecision()
+
             live_open = is_market_open(now_utc())
 
             if live_open:
@@ -778,7 +790,7 @@ def live_thread(stop: threading.Event):
                 if live_session_id is None:
                     start_live_session()
 
-                # Drawdown gate
+                # Risk kill switch
                 if portfolio and portfolio.equity > 0:
                     peak = max(STATE.get('peak_equity', portfolio.equity), portfolio.equity)
                     with STATE_LOCK: STATE['peak_equity'] = peak
@@ -786,7 +798,7 @@ def live_thread(stop: threading.Event):
                     if dd >= MAX_LIVE_DRAWDOWN:
                         flatten_all("max drawdown breach"); time.sleep(POLL_SECONDS); continue
 
-                # Pull latest minute data in manageable chunks
+                # Latest minute data for a capped universe
                 live_names = tickers[:MAX_LIVE_TICKERS]
                 data = yf.download(live_names, period="2d", interval="1m", progress=False, auto_adjust=True)
                 closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
@@ -794,7 +806,7 @@ def live_thread(stop: threading.Event):
                 if last_prices is None:
                     last_prices = latest; time.sleep(POLL_SECONDS); continue
 
-                # Execute previous decision
+                # Execute previous decision at current prices (t -> t+1)
                 if decision.action is not None and portfolio is not None:
                     a = int(decision.action); risk = float(decision.risk)
                     if a != env.cash_idx and a < len(live_names):
@@ -817,7 +829,7 @@ def live_thread(stop: threading.Event):
                             })
                             with STATE_LOCK: STATE['today_trades'] += 1
 
-                # Update marks and state
+                # Update marks
                 prices_map = {t: float(latest.get(t, np.nan)) for t in live_names if not np.isnan(latest.get(t, np.nan))}
                 if portfolio is not None:
                     portfolio.mark_to_market(prices_map)
@@ -828,10 +840,11 @@ def live_thread(stop: threading.Event):
                         STATE['unrealized_pnl'] = float(portfolio.unrealized_pnl)
                         STATE['equity'] = float(portfolio.equity)
 
-                # Build obs
+                # Build features up to current bar and DECIDE for next bar
                 common = latest.index.intersection(last_prices.index)
                 rets = (latest[common] / last_prices[common] - 1.0).reindex(live_names).fillna(0.0)
                 last_prices = latest
+
                 intraday_buf.append(rets.values.astype(np.float32))
                 if len(intraday_buf) > WINDOW: intraday_buf.pop(0)
                 if len(intraday_buf) < WINDOW:
@@ -839,11 +852,16 @@ def live_thread(stop: threading.Event):
                 obs_np = np.stack(intraday_buf, axis=0).astype(np.float32)
                 risk = float(day_risk or sample_risk())
                 obs_np = np.concatenate([obs_np, np.full((WINDOW,1), risk, np.float32)], axis=1)
+
+                # Stochastic policy for exploration (helps learning offline + diversity)
                 with torch.no_grad():
                     logits, _ = agent.net(torch.tensor(obs_np, dtype=torch.float32).unsqueeze(0))
-                    a = int(torch.argmax(logits, dim=-1).item())
+                    dist = torch.distributions.Categorical(logits=logits)
+                    a = int(dist.sample().item())
+
                 decision.action = a; decision.risk = risk
 
+                # Drawdown metric
                 with STATE_LOCK:
                     peak_eq = max(STATE.get('peak_equity', portfolio.equity if portfolio else 0.0), portfolio.equity if portfolio else 0.0)
                     STATE['peak_equity'] = peak_eq
@@ -851,6 +869,7 @@ def live_thread(stop: threading.Event):
                     STATE['max_drawdown'] = float(dd)
                 time.sleep(POLL_SECONDS); continue
 
+            # Market closed -> run backtest AND keep learning from it
             if BACKTEST_WHEN_CLOSED:
                 with STATE_LOCK: STATE['status'] = STATE['mode'] = 'backtest'
                 back_obs, back_s = env.reset(); backtest_session_id = f"bt-{int(time.time())}"; eq = float(env.e0)
@@ -866,10 +885,18 @@ def live_thread(stop: threading.Event):
                 })
                 with STATE_LOCK:
                     STATE['session_id'] = backtest_session_id; STATE['equity'] = eq; STATE['today_trades'] = 0; STATE['today_pnl'] = 0.0
-                for _ in range(5000):
+
+                # Collect a small backtest rollout and update immediately (online style)
+                obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
+                for _ in range(3000):
                     a, lp, v = agent.act(back_obs)
                     nobs, r, done, back_s, realized_r, exec_price = env.step(a, back_s)
-                    risk = float(back_obs[0,-1]); notional = eq * risk; fee = abs(notional) * FEE_BPS; pnl = notional * realized_r - fee; eq += pnl
+                    risk = float(back_obs[0,-1]); notional = eq * risk
+                    fee = abs(notional) * FEE_BPS
+                    pnl = notional * realized_r - fee
+                    eq += pnl
+
+                    # Log trade
                     ticker = env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"
                     qty = (abs(notional) / max(exec_price, 1e-6)) if ticker != "CASH" else 0.0
                     et = now_utc().astimezone(tz)
@@ -886,13 +913,49 @@ def live_thread(stop: threading.Event):
                     with STATE_LOCK:
                         STATE['today_trades'] += 1; STATE['equity'] = float(eq); STATE['today_pnl'] = float(STATE.get('today_pnl', 0.0) + pnl)
                         peak_eq = max(STATE.get('peak_equity', eq), eq); STATE['peak_equity'] = peak_eq; STATE['max_drawdown'] = float(0.0 if peak_eq<=0 else (peak_eq - eq)/peak_eq)
+
+                    # Collect experience for immediate PPO update
+                    obs_buf.append(back_obs); act_buf.append(a); logp_buf.append(lp); rew_buf.append(r); val_buf.append(v)
+
                     back_obs = nobs
-                    if done: break
+                    if len(obs_buf) >= PPO_CFG['minibatch_size'] * 2 or done:
+                        # Build a mini-batch and update online
+                        gamma = PPO_CFG['gamma']; lam = PPO_CFG['gae_lambda']
+                        rewards = np.array(rew_buf, dtype=np.float32)
+                        values = np.array(val_buf + [0.0], dtype=np.float32)
+                        adv = np.zeros_like(rewards); gae = 0.0
+                        for tt in reversed(range(len(rewards))):
+                            delta = rewards[tt] + gamma * values[tt+1] - values[tt]
+                            gae = delta + gamma * lam * gae
+                            adv[tt] = gae
+                        ret = values[:-1] + adv
+                        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+                        batch = {
+                            'obs': torch.tensor(np.array(obs_buf), dtype=torch.float32),
+                            'actions': torch.tensor(np.array(act_buf), dtype=torch.long),
+                            'logp': torch.tensor(np.array(logp_buf), dtype=torch.float32),
+                            'ret': torch.tensor(ret, dtype=torch.float32),
+                            'adv': torch.tensor(adv, dtype=torch.float32)
+                        }
+                        agent.update(batch)
+                        # Clear buffers
+                        obs_buf, act_buf, logp_buf, rew_buf, val_buf = [], [], [], [], []
+
+                        # Save occasionally so live thread can hot-reload
+                        save_checkpoint(agent, "bt-online", stats=TRAIN_STATS)
+
+                    if done:
+                        break
                     time.sleep(BACKTEST_POLL_SECONDS)
-                time.sleep(3); continue
-            with STATE_LOCK: STATE['status'] = STATE['mode'] = 'idle'; time.sleep(5)
+                time.sleep(2); continue
+
+            with STATE_LOCK: STATE['status'] = STATE['mode'] = 'idle'
+            time.sleep(5)
+
         except Exception as e:
-            with STATE_LOCK: STATE['status'] = STATE['mode'] = f"error: {e}"; time.sleep(POLL_SECONDS)
+            with STATE_LOCK:
+                STATE['status'] = STATE['mode'] = f"error: {e}"
+            time.sleep(POLL_SECONDS)
 
 # ===================== API =====================
 app = FastAPI()
@@ -901,7 +964,6 @@ app.add_middleware(
     allow_origins=[CORS_ORIGIN] if CORS_ORIGIN != "*" else ["*"],
     allow_credentials=False, allow_methods=["*"], allow_headers=["*"]
 )
-
 
 def require_key(authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -934,14 +996,14 @@ def metrics(_: None = Depends(require_key)):
 @app.get("/stats")
 def stats(_: None = Depends(require_key)):
     with STATE_LOCK:
-        s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity")}
+        s = {k: STATE.get(k) for k in (
+            "train_reward_mean","train_win_rate","last_train_utc",
+            "universe","max_drawdown","today_trades","cash",
+            "positions_value","unrealized_pnl","equity"
+        )}
     return {"train": TRAIN_STATS, "state": s}
 
-class TradesQuery(BaseModel):
-    limit: int = 100
-    cursor: int = 0
-    session: Optional[str] = None
-
+# ---------- Trades browse ----------
 @app.get("/trades")
 def trades(limit: int = Query(100, ge=1, le=500), cursor: int = 0, session: Optional[str] = None, _: None = Depends(require_key)):
     if session is None:
@@ -972,46 +1034,9 @@ def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends
     series = [{"t": (now - timedelta(minutes=m)).isoformat(), "equity": eq} for m in range(60, -1, -1)]
     return {"series": series, "session": session}
 
-@app.post("/seed")
-def seed(_: None = Depends(require_key)):
-    with STATE_LOCK:
-        eq = float(STATE.get("equity", 1000.0))
-        session_id = STATE.get("session_id", "seed")
-    et = now_utc().astimezone(pytz.timezone(MARKET_TZ))
-    for i in range(20):
-        pnl = (i - 10) * 0.5
-        eq += pnl
-        insert_trade({
-            "session_id": session_id,"mode":"BACKTEST","ts_utc":now_utc().isoformat(),"ts_et":et.isoformat(),
-            "side":"MARK","ticker":"AAPL","qty":1.0,"fill_price":100.0+i,"notional":100.0+i,
-            "fees_bps":FEE_BPS,"slippage_bps":SLIPPAGE_BPS,"risk_frac":0.1,
-            "position_before":0.0,"position_after":1.0,
-            "cost_basis_before":0.0,"cost_basis_after":100.0,
-            "realized_pnl":pnl if pnl>0 else 0.0,
-            "realized_pnl_pct":(pnl/(100.0+i)) if pnl>0 else 0.0,
-            "equity_after":eq,"reason":"seed"
-        })
-    return {"ok": True}
-
-@app.post("/snapshot")
-def snapshot(_: None = Depends(require_key)):
-    ts = datetime.utcnow().strftime("%H%M%S")
-    try:
-        env, _, _ = build_env()
-        agent = PPO(WINDOW, env.X.shape[1]+1, env.N_assets+1, PPO_CFG)
-        if os.path.exists(MODEL_PATH):
-            state = torch.load(MODEL_PATH, map_location='cpu')
-            if isinstance(state, dict) and 'net' in state:
-                agent.net.load_state_dict(state['net'])
-        save_checkpoint(agent, f"manual-{ts}")
-        return {"ok": True}
-    except Exception as e:
-        raise HTTPException(500, detail=str(e))
-
 # ---------- Admin hard reset ----------
 class ResetReq(BaseModel):
     password: str
-
 
 def hard_reset():
     with STATE_LOCK:
@@ -1046,7 +1071,7 @@ def hard_reset():
 
 @app.post("/admin/reset")
 def admin_reset(req: ResetReq, _: None = Depends(require_key)):
-    if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
+    if req.password not in (API_KEY, ADMIN_RESET_PASSWORD):
         raise HTTPException(403, detail="Bad admin password")
     hard_reset()
     return {"ok": True, "message": "Reset complete"}
@@ -1057,6 +1082,6 @@ threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
 threading.Thread(target=live_thread, args=(STOP,), daemon=True).start()
 
 if __name__ == "__main__":
-    if API_KEY == "changeme":
-        print("WARNING: Set API_KEY env var before exposing this service.")
+    if API_KEY == "changeme" or ADMIN_RESET_PASSWORD == "please-change-me":
+        print("WARNING: Set API_KEY and ADMIN_RESET_PASSWORD before exposing this service.")
     uvicorn.run(app, host="0.0.0.0", port=PORT)
