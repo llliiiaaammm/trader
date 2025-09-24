@@ -5,51 +5,94 @@
   <title>RL Trader — Paper</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial; margin: 16px; }
-    .grid { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }
-    .stat { line-height: 1.6; }
-    .stat b { font-size: 14px; }
-    canvas { max-width: 100%; }
-    table { width: 100%; border-collapse: collapse; }
-    th, td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
-    th { text-align: left; }
-    .muted { color: #666; font-size: 12px; }
+    :root {
+      --bg:#0b0e14; --fg:#e6e6e6; --muted:#8a8f98;
+      --card:#11151d; --border:#222836; --accent:#6ea8fe; --red:#ff6b6b; --green:#87d37c;
+    }
+    *{box-sizing:border-box}
+    body { background:var(--bg); color:var(--fg); font-family: ui-sans-serif, -apple-system, Segoe UI, Roboto, Helvetica, Arial; margin: 16px; }
+    .grid { display: grid; grid-template-columns: 300px 1fr; gap: 20px; align-items: start; }
+    .card { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:14px 16px; }
+    .stat b { font-size: 15px; }
+    .muted { color: var(--muted); font-size: 12px; }
+    .row { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    hr { border:0; border-top:1px solid var(--border); margin:10px 0; }
+    button, input, select { background:#151a24; color:var(--fg); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+    button:hover { border-color:#33415c; }
+    table { width: 100%; border-collapse: collapse; background:var(--card); border:1px solid var(--border); border-radius:12px; overflow:hidden; }
+    th, td { padding: 8px 10px; border-bottom: 1px solid var(--border); font-size: 13px; }
+    th { text-align: left; color:var(--muted); background:#0f131b; position:sticky; top:0; }
+    .bad { color: var(--red); } .good{ color: var(--green); }
+    .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; background:#141a23; border:1px solid var(--border); }
   </style>
 </head>
 <body>
-  <button id="resetBtn">Reset AI (admin)</button>
+  <div class="row" style="justify-content:space-between; margin-bottom:10px;">
+    <div class="row">
+      <button id="resetBtn">Reset AI</button>
+      <button id="pauseBtn">Pause</button>
+      <button id="resumeBtn">Resume</button>
+      <button id="paramsBtn">Params</button>
+    </div>
+    <form id="tradeForm" class="row" onsubmit="return false;">
+      <select id="tradeSide">
+        <option>BUY</option><option>SELL</option>
+      </select>
+      <input id="tradeTicker" placeholder="Ticker (e.g. AAPL)" size="12" />
+      <input id="tradeNotional" placeholder="Notional ($)" size="12" />
+      <button id="tradeBtn">Manual trade</button>
+    </form>
+  </div>
+
   <div class="grid">
-    <div class="stat">
+    <div class="card stat">
       <div class="muted">Mode/Status</div>
       <div id="mode"><b>idle</b></div>
+
+      <hr/>
       <div>Equity<br><b id="equity">$0.00</b></div>
-      <div>Today PnL<br><b id="pnl">$0.00</b></div>
+      <div>Today PnL<br><b id="pnl" class="pill">$0.00</b></div>
       <div>Trades Today<br><b id="trades">0</b></div>
       <div>Universe<br><b id="universe">0</b></div>
       <div>Max DD<br><b id="dd">0.00%</b></div>
-      <hr />
+
+      <hr/>
+      <div>Block risk<br><b id="blockRisk">–</b></div>
+      <div>Block start cash<br><b id="blockCash">–</b></div>
+
+      <hr/>
       <div>Cash <b id="cash">$0.00</b></div>
       <div>Investment <b id="invested">$0.00</b></div>
       <div>Unrealized PnL <b id="upnl">$0.00</b></div>
-      <hr />
+
+      <hr/>
       <div>Reward ⌀ <b id="rewardMean">0.0000</b></div>
       <div>Win rate <b id="winRate">0.0%</b></div>
       <div>Last train <b id="lastTrain">–</b></div>
+      <div class="muted">Benchmark: <span class="pill">SPY</span></div>
     </div>
+
     <div>
-      <canvas id="equityChart" height="120"></canvas>
-      <h3>Recent trades</h3>
-      <table>
-        <thead>
-          <tr>
-            <th>ID</th><th>Mode</th><th>ET</th><th>Side</th><th>Ticker</th>
-            <th>Qty</th><th>Price</th><th>Notional</th><th>Risk</th><th>Realized PnL</th><th>Equity After</th><th>Reason</th>
-          </tr>
-        </thead>
-        <tbody id="tradesBody"></tbody>
-      </table>
+      <div class="card" style="margin-bottom:14px;">
+        <canvas id="equityChart" height="120"></canvas>
+      </div>
+      <div class="card">
+        <h3 style="margin:6px 0 12px 0;">Recent trades</h3>
+        <table>
+          <thead>
+            <tr>
+              <th>ID</th><th>Mode</th><th>ET</th><th>Side</th><th>Ticker</th>
+              <th>Qty</th><th>Price</th><th>Notional</th><th>Risk</th>
+              <th>Realized PnL</th><th>Equity After</th><th>Reason</th>
+            </tr>
+          </thead>
+          <tbody id="tradesBody"></tbody>
+        </table>
+      </div>
+      <pre id="paramsBox" class="card" style="display:none; white-space:pre-wrap; margin-top:14px; max-height:260px; overflow:auto;"></pre>
     </div>
   </div>
+
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0"></script>
   <script src="./app.js"></script>
