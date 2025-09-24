@@ -8,28 +8,33 @@
     body { font-family: -apple-system, system-ui, Segoe UI, Roboto, Helvetica, Arial; margin: 16px; }
     .grid { display: grid; grid-template-columns: 260px 1fr; gap: 24px; align-items: start; }
     .stat { line-height: 1.6; }
+    .stat b { font-size: 14px; }
     canvas { max-width: 100%; }
     table { width: 100%; border-collapse: collapse; }
     th, td { padding: 6px 8px; border-bottom: 1px solid #eee; font-size: 13px; }
     th { text-align: left; }
+    .muted { color: #666; font-size: 12px; }
   </style>
 </head>
 <body>
   <button id="resetBtn">Reset AI (admin)</button>
   <div class="grid">
     <div class="stat">
-      <div id="mode">idle</div>
+      <div class="muted">Mode/Status</div>
+      <div id="mode"><b>idle</b></div>
       <div>Equity<br><b id="equity">$0.00</b></div>
       <div>Today PnL<br><b id="pnl">$0.00</b></div>
       <div>Trades Today<br><b id="trades">0</b></div>
       <div>Universe<br><b id="universe">0</b></div>
       <div>Max DD<br><b id="dd">0.00%</b></div>
-      <div>Cash <span id="cash">$0.00</span></div>
-      <div>Investment <span id="invested">$0.00</span></div>
-      <div>Unrealized PnL <span id="upnl">$0.00</span></div>
-      <div>Reward ⌀ <span id="rewardMean">0.0000</span></div>
-      <div>Win rate <span id="winRate">0.0%</span></div>
-      <div>Last train <span id="lastTrain">–</span></div>
+      <hr />
+      <div>Cash <b id="cash">$0.00</b></div>
+      <div>Investment <b id="invested">$0.00</b></div>
+      <div>Unrealized PnL <b id="upnl">$0.00</b></div>
+      <hr />
+      <div>Reward ⌀ <b id="rewardMean">0.0000</b></div>
+      <div>Win rate <b id="winRate">0.0%</b></div>
+      <div>Last train <b id="lastTrain">–</b></div>
     </div>
     <div>
       <canvas id="equityChart" height="120"></canvas>
