@@ -1,13 +1,26 @@
+// All frontend calls go through Netlify proxy as /api/*
+// The proxy injects Authorization using Netlify env (API_KEY)
+// and forwards to your Render BASE_URL.
 const API_BASE = "/api";
 
+// --- helpers
+const fmtUSD = (n) => {
+  const v = Number(n || 0);
+  return v >= 0 ? `$${v.toFixed(2)}` : `-$${Math.abs(v).toFixed(2)}`;
+};
+const pct = (x) => `${(Number(x || 0) * 100).toFixed(2)}%`;
+
+// --- generic fetch
 async function getJSON(path) {
-  const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
   return res.json();
 }
 
 async function postJSON(path, body) {
-  const res = await fetch(`${API_BASE}${path}`, {
+  const url = `${API_BASE}${path}`;
+  const res = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
@@ -16,6 +29,7 @@ async function postJSON(path, body) {
   return res.json();
 }
 
+// --- admin reset
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password to reset all model & trades:");
   if (!pwd) return;
@@ -27,26 +41,23 @@ document.getElementById("resetBtn")?.addEventListener("click", async () => {
   }
 });
 
-const fmtUSD = (n) => (Number(n) >= 0 ? `$${Number(n).toFixed(2)}` : `-$${Math.abs(Number(n)).toFixed(2)}`);
-const pct = (x) => `${(Number(x) * 100).toFixed(2)}%`;
-
+// --- metrics
 async function loadMetrics() {
   const m = await getJSON("/metrics");
-  // Backend exposes: mode/status/equity/cash/positions_value/unrealized_pnl/today_pnl/today_trades/universe/max_drawdown
-  document.getElementById("mode").textContent = m.status || "idle";
-  document.getElementById("equity").textContent = fmtUSD(m.equity || 0);
-  document.getElementById("pnl").textContent = fmtUSD(m.today_pnl || 0);
+  document.getElementById("mode").innerHTML = `<b>${m.status || "idle"}</b>`;
+  document.getElementById("equity").textContent = fmtUSD(m.equity);
+  document.getElementById("pnl").textContent = fmtUSD(m.today_pnl);
   document.getElementById("trades").textContent = Number(m.today_trades || 0);
-
-  // New fields:
-  document.getElementById("cash").textContent = fmtUSD(m.cash || 0);
-  document.getElementById("invested").textContent = fmtUSD(m.positions_value || 0);
-  document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl || 0);
-
   document.getElementById("universe").textContent = Number(m.universe || 0);
-  document.getElementById("dd").textContent = pct(m.max_drawdown || 0);
+  document.getElementById("dd").textContent = pct(m.max_drawdown);
+
+  // wallet block
+  document.getElementById("cash").textContent = fmtUSD(m.cash);
+  document.getElementById("invested").textContent = fmtUSD(m.positions_value);
+  document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
 }
 
+// --- equity chart
 let eqChart;
 async function loadEquity() {
   const { series = [] } = await getJSON("/equity");
@@ -56,12 +67,25 @@ async function loadEquity() {
     const ctx = document.getElementById("equityChart").getContext("2d");
     eqChart = new Chart(ctx, {
       type: "line",
-      data: { datasets: [{ label: "Equity", data: points, tension: 0.2, pointRadius: 0 }] },
+      data: {
+        datasets: [{
+          label: "Equity",
+          data: points,
+          tension: 0.2,
+          pointRadius: 0,
+          fill: false
+        }]
+      },
       options: {
+        responsive: true,
         animation: false,
-        parsing: true,
+        parsing: true,      // parse {x,y}
+        interaction: { mode: "nearest", intersect: false },
         scales: {
-          x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" } },
+          x: {
+            type: "time",
+            time: { unit: "minute", tooltipFormat: "MMM d, HH:mm" }
+          },
           y: { beginAtZero: false }
         },
         plugins: { legend: { display: true } }
@@ -73,11 +97,13 @@ async function loadEquity() {
   }
 }
 
+// --- trades table (paged by cursor; we show most recent page)
 let tradesCursor = 0;
 async function loadTrades() {
   const payload = await getJSON(`/trades?limit=100&cursor=${tradesCursor}`);
   tradesCursor = payload.next_cursor || tradesCursor;
   const rows = payload.data || [];
+
   const tbody = document.getElementById("tradesBody");
   tbody.innerHTML = "";
   for (const r of rows) {
@@ -100,21 +126,22 @@ async function loadTrades() {
   }
 }
 
-// NEW: training stats (/api/stats)
+// --- training stats (/stats)
 async function loadStats() {
   const s = await getJSON("/stats");
-  const train = s.state || {};
-  const hist  = s.train || {};
-  const reward = train.train_reward_mean ?? hist.last_reward_mean ?? 0;
-  const win    = train.train_win_rate   ?? hist.last_win_rate   ?? 0;
+  const state = s.state || {};
+  const train = s.train || {};
+
+  const reward = state.train_reward_mean ?? train.last_reward_mean ?? 0;
+  const win    = state.train_win_rate   ?? train.last_win_rate   ?? 0;
 
   document.getElementById("rewardMean").textContent = Number(reward).toFixed(4);
   document.getElementById("winRate").textContent = `${(Number(win) * 100).toFixed(1)}%`;
-  if (hist.last_time_utc) {
-    document.getElementById("lastTrain").textContent = new Date(hist.last_time_utc).toLocaleString();
-  }
+  document.getElementById("lastTrain").textContent =
+    train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
+// --- refresh loop
 async function refresh() {
   try {
     await Promise.all([loadMetrics(), loadEquity(), loadTrades(), loadStats()]);
