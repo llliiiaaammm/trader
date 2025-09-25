@@ -32,7 +32,7 @@ async function waitForApiReady() {
   }
 }
 
-// admin buttons (unchanged)
+// admin buttons
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password:");
   if (!pwd) return;
@@ -88,7 +88,7 @@ async function loadMetrics() {
   document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
 }
 
-// equity
+// equity (with cached benchmark every 60s)
 let eqChart;
 let lastBenchAt = 0;
 async function loadEquity() {
