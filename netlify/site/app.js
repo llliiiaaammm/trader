@@ -24,6 +24,19 @@ async function postJSON(path, body) {
   return res.json();
 }
 
+// -------- API warm-up to avoid 504s on cold starts --------
+let ready = false;
+async function waitForApiReady() {
+  for (let i = 0; i < 8; i++) {
+    try {
+      const r = await fetch(`${API_BASE}/healthz`, { cache: "no-store" });
+      if (r.ok) { ready = true; return; }
+    } catch {}
+    await new Promise(r => setTimeout(r, 1500));
+  }
+  // continue anyway; subsequent calls will retry on next refresh loop
+}
+
 // admin: reset/pause/resume/params
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password:");
@@ -58,13 +71,9 @@ document.getElementById("paramsBtn")?.addEventListener("click", async () => {
 document.getElementById("tradeBtn")?.addEventListener("click", async () => {
   const password = prompt("Admin password for manual trade:");
   if (!password) return;
-  const sideEl = document.getElementById("tradeSide");
-  const tickerEl = document.getElementById("tradeTicker");
-  const notionalEl = document.getElementById("tradeNotional");
-  if (!sideEl || !tickerEl) return alert("Missing inputs in the page.");
-  const side = sideEl.value;
-  const ticker = tickerEl.value.trim().toUpperCase();
-  const notional = parseFloat((notionalEl?.value ?? "0") || "0");
+  const side = document.getElementById("tradeSide").value;
+  const ticker = document.getElementById("tradeTicker").value.trim().toUpperCase();
+  const notional = parseFloat(document.getElementById("tradeNotional").value || "0");
   if (!ticker || !side) return alert("Provide side and ticker.");
   try {
     await postJSON("/admin/trade", { password, side, ticker, notional: isNaN(notional)?undefined:notional });
@@ -90,12 +99,17 @@ async function loadMetrics() {
   document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
 }
 
-// equity chart with benchmark
+// equity chart with cached/occasional benchmark fetch
 let eqChart;
+let lastBenchAt = 0;
+
 async function loadEquity() {
-  const { series = [], bench = [] } = await getJSON("/equity");
+  const wantBench = (Date.now() - lastBenchAt) > 60_000; // once a minute
+  const { series = [], bench = [] } = await getJSON(`/equity?bench=${wantBench ? 1 : 0}`);
+  if (wantBench) lastBenchAt = Date.now();
+
   const equityPts = series.map(p => ({ x: p.t, y: Number(p.equity) }));
-  const benchPts  = bench.map(p => ({ x: p.t, y: Number(p.equity) }));
+  const benchPts  = (bench || []).map(p => ({ x: p.t, y: Number(p.equity) }));
 
   if (!eqChart) {
     const ctx = document.getElementById("equityChart").getContext("2d");
@@ -104,7 +118,7 @@ async function loadEquity() {
       data: {
         datasets: [
           { label: "Equity", data: equityPts, tension: 0.25, pointRadius: 0 },
-          { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderDash: [4,3] }
+          { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderColor: "#ff6b6b" }
         ]
       },
       options: {
@@ -121,10 +135,8 @@ async function loadEquity() {
     });
   } else {
     eqChart.data.datasets[0].data = equityPts;
-    if (eqChart.data.datasets[1]) {
+    if (benchPts.length) {
       eqChart.data.datasets[1].data = benchPts;
-    } else {
-      eqChart.data.datasets.push({ label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderDash: [4,3] });
     }
     eqChart.update();
   }
@@ -177,9 +189,15 @@ async function refresh() {
   try {
     await Promise.all([loadMetrics(), loadEquity(), loadTrades(), loadStats()]);
   } catch (e) {
+    // swallow transient 5xx/504s; console only
     console.warn("UI refresh error:", e.message);
   } finally {
     setTimeout(refresh, 5000);
   }
 }
-refresh();
+
+// boot
+(async () => {
+  await waitForApiReady();
+  refresh();
+})();
