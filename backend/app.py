@@ -4,6 +4,11 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
+# ---- keep memory use low on small instances (Render Free, etc.)
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
+
 import numpy as np
 import pandas as pd
 import pytz
@@ -17,6 +22,10 @@ from fastapi.responses import JSONResponse
 from fastapi import Response
 from pydantic import BaseModel
 import uvicorn
+try:
+    torch.set_num_threads(1)
+except Exception:
+    pass
 
 # ===================== CONFIG =====================
 API_KEY = os.getenv("API_KEY", "changeme")
@@ -34,18 +43,18 @@ BACKTEST_WHEN_CLOSED = os.getenv("BACKTEST_WHEN_CLOSED", "true").lower() == "tru
 
 # Always-on training
 CONTINUOUS_TRAIN = os.getenv("CONTINUOUS_TRAIN", "true").lower() == "true"
-CONTINUOUS_ROLLOUT_STEPS = int(os.getenv("CONTINUOUS_ROLLOUT_STEPS", "1024"))
-CONTINUOUS_SLEEP_SECS = int(os.getenv("CONTINUOUS_SLEEP_SECS", "10"))
+CONTINUOUS_ROLLOUT_STEPS = int(os.getenv("CONTINUOUS_ROLLOUT_STEPS", "512"))  # lighter by default
+CONTINUOUS_SLEEP_SECS = int(os.getenv("CONTINUOUS_SLEEP_SECS", "15"))
 CHECKPOINT_POLL_SECS = int(os.getenv("CHECKPOINT_POLL_SECS", "60"))
 
-# Training data granularity
+# Training data granularity (tuned to avoid OOM on 512MB)
 TRAIN_INTERVAL = os.getenv("TRAIN_INTERVAL", "1d")  # '1d' or '1m'
-HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))
-INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "30"))
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "2"))
+INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "10"))
 WINDOW = int(os.getenv("WINDOW", "30"))
 AUTO_FETCH_SP500 = os.getenv("AUTO_FETCH_SP500", "true").lower() == "true"
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))
-MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "60"))
+MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "40"))
 
 # Risk sizing
 EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))
@@ -211,8 +220,8 @@ class HistoryBundle:
 # Generic chunked downloader for daily bars
 def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
     frames_p, frames_v = [], []
-    for i in range(0, len(tickers), 100):
-        chunk = tickers[i:i+100]
+    for i in range(0, len(tickers), 50):  # keep peak RAM down
+        chunk = tickers[i:i+50]
         dfi = yf.download(chunk, start=start, end=end, interval="1d", auto_adjust=True,
                           progress=False, group_by="column", threads=True)
         if isinstance(dfi.columns, pd.MultiIndex):
@@ -226,7 +235,6 @@ def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) 
     return closes, vols
 
 def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intraday_days: int = 30) -> HistoryBundle:
-    synthetic = False
     tickers = list(tickers)[:MAX_TICKERS] if tickers else list(FALLBACK_TICKERS)
 
     if interval == "1d":
@@ -806,7 +814,6 @@ def live_thread(stop: threading.Event):
 
                 # Drain manual orders if any
                 if portfolio is not None and ADMIN_QUEUE:
-                    # fetch a fresh price snapshot
                     live_names = tickers[:MAX_LIVE_TICKERS]
                     snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True)
                     closes = snap["Close"] if isinstance(snap.columns, pd.MultiIndex) else snap
@@ -942,13 +949,12 @@ def live_thread(stop: threading.Event):
                     ticker = env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"
                     qty = (abs(notional) / max(exec_price, 1e-6)) if ticker != "CASH" else 0.0
 
-                    # For UI parity: show cash/invested this step
                     positions_value = abs(notional) if ticker != "CASH" else 0.0
                     cash = float(eq - positions_value)
                     with STATE_LOCK:
                         STATE['cash'] = cash
                         STATE['positions_value'] = positions_value
-                        STATE['unrealized_pnl'] = 0.0  # closed each step
+                        STATE['unrealized_pnl'] = 0.0
                         STATE['equity'] = float(eq)
 
                     tznow = now_utc().astimezone(tz)
@@ -1039,20 +1045,37 @@ def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends
     series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None][-2000:]
 
     # Benchmark series (SPY by default) normalized to starting equity
+    def _to_naive(ts):
+        try:
+            return ts.tz_convert(None)
+        except Exception:
+            try:
+                return ts.tz_localize(None)
+            except Exception:
+                return ts
+
     try:
-        t0 = pd.to_datetime(series[0]["t"])
-        t1 = pd.to_datetime(series[-1]["t"])
+        t0 = _to_naive(pd.to_datetime(series[0]["t"]))
+        t1 = _to_naive(pd.to_datetime(series[-1]["t"]))
         span_days = max(1, (t1 - t0).days)
         interval = "1m" if span_days <= 3 else "1d"
-        df = yf.download(BENCH_SYMBOL, start=t0.tz_localize(None), end=(t1 + pd.Timedelta(days=1)).tz_localize(None),
+        df = yf.download(BENCH_SYMBOL, start=t0, end=t1 + pd.Timedelta(days=1),
                          interval=interval, auto_adjust=True, progress=False)
         if isinstance(df, pd.DataFrame) and not df.empty:
             px = df["Close"].dropna()
             idx = pd.to_datetime([p["t"] for p in series])
+            # make idx naive to match px
+            try:
+                idx = idx.tz_convert(None)
+            except Exception:
+                try:
+                    idx = idx.tz_localize(None)
+                except Exception:
+                    pass
             aligned = px.reindex(idx, method="pad")
-            if not aligned.empty and aligned.iloc[0] > 0:
+            if not aligned.empty and float(aligned.iloc[0]) > 0:
                 start_eq = float(series[0]["equity"])
-                bench_vals = start_eq * (aligned / aligned.iloc[0])
+                bench_vals = start_eq * (aligned / float(aligned.iloc[0]))
                 bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(idx, bench_vals)]
             else:
                 bench = []
