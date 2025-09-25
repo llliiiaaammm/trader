@@ -74,7 +74,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 AGENT_LOCK = threading.Lock()
 PAUSED = threading.Event()
 
-# Manual order queue
+# Manual order queue (endpoints stay; UI removed)
 class AdminOrder(BaseModel):
     side: str
     ticker: str
@@ -233,7 +233,7 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
     returns_df = prices_df.pct_change().dropna(how="all")
     return HistoryBundle(prices_df, returns_df, list(prices_df.columns), None, None, None, synthetic=True)
 
-# ===================== ENV / PPO (unchanged core) =====================
+# ===================== ENV / PPO =====================
 @dataclass
 class EpState:
     t: int
@@ -453,6 +453,10 @@ STATE = {
     "block_risk": None,
     "block_cash": None,
     "paused": False,
+    # live training stats mirrors (so UI shows immediately)
+    "train_reward_mean": 0.0,
+    "train_win_rate": 0.0,
+    "last_train_utc": None,
 }
 STATE_LOCK = threading.Lock()
 REINIT_EVENT = threading.Event()
@@ -596,12 +600,17 @@ def trainer_thread(stop: threading.Event):
 
             r = float(batch['ret'].mean().item())
             w = float((batch['ret']>0).float().mean().item())
-            TRAIN_STATS.update({"last_reward_mean": r, "last_win_rate": w, "last_time_utc": now_utc().isoformat()})
+            now_iso = now_utc().isoformat()
+            TRAIN_STATS.update({"last_reward_mean": r, "last_win_rate": w, "last_time_utc": now_iso})
             with get_db() as conn:
                 conn.execute(
                     "INSERT INTO train_events(ts_utc, interval, reward_mean, win_rate, notes) VALUES (?,?,?,?,?)",
-                    (TRAIN_STATS['last_time_utc'], TRAIN_INTERVAL, r, w, "continuous"))
+                    (now_iso, TRAIN_INTERVAL, r, w, "continuous"))
                 conn.commit()
+            with STATE_LOCK:
+                STATE["train_reward_mean"] = r
+                STATE["train_win_rate"] = w
+                STATE["last_train_utc"] = now_iso
             save_checkpoint(agent, "cont")
             time.sleep(CONTINUOUS_SLEEP_SECS)
         except Exception as e:
@@ -695,8 +704,8 @@ def live_thread(stop: threading.Event):
             insert_trade({
                 "session_id": live_session_id, "mode": "LIVE",
                 "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
-                "side": "SELL" if q>0 else "BUY", "ticker": t, "qty": abs(qty_exec), "fill_price": p,
-                "notional": abs(notional), "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
+                "side": "SELL" if q>0 else "BUY", "ticker": t, "qty": round(abs(qty_exec), 6), "fill_price": p,
+                "notional": round(abs(notional), 2), "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
                 "risk_frac": float(day_risk or 0.0), "position_before": float(q), "position_after": float(portfolio.positions.get(t,0.0)),
                 "cost_basis_before": 0.0, "cost_basis_after": float(portfolio.cost_basis.get(t,0.0)),
                 "realized_pnl": realized, "realized_pnl_pct": 0.0,
@@ -763,7 +772,7 @@ def live_thread(stop: threading.Event):
                 if live_session_id is None:
                     start_live_session()
 
-                # Manual orders
+                # Manual orders (UI removed, endpoint remains)
                 if portfolio is not None and ADMIN_QUEUE:
                     live_names = tickers[:MAX_LIVE_TICKERS]
                     snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True)
@@ -782,7 +791,7 @@ def live_thread(stop: threading.Event):
                                 "session_id": live_session_id, "mode": "LIVE",
                                 "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
                                 "side": order.side.upper(), "ticker": order.ticker,
-                                "qty": abs(qty_exec), "fill_price": px, "notional": abs(notional),
+                                "qty": round(abs(qty_exec), 6), "fill_price": px, "notional": round(abs(notional), 2),
                                 "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS, "risk_frac": float(day_risk or 0.0),
                                 "position_before": 0.0, "position_after": float(portfolio.positions.get(order.ticker,0.0)),
                                 "cost_basis_before": 0.0, "cost_basis_after": float(portfolio.cost_basis.get(order.ticker,0.0)),
@@ -820,7 +829,7 @@ def live_thread(stop: threading.Event):
                                 "session_id": live_session_id, "mode": "LIVE",
                                 "ts_utc": now_utc().isoformat(), "ts_et": et.isoformat(),
                                 "side": "BUY" if notional>0 else "SELL", "ticker": ticker,
-                                "qty": abs(qty_exec), "fill_price": price, "notional": abs(notional),
+                                "qty": round(abs(qty_exec), 6), "fill_price": price, "notional": round(abs(notional), 2),
                                 "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS, "risk_frac": risk,
                                 "position_before": 0.0, "position_after": float(portfolio.positions.get(ticker,0.0)),
                                 "cost_basis_before": 0.0, "cost_basis_after": float(portfolio.cost_basis.get(ticker,0.0)),
@@ -895,6 +904,8 @@ def live_thread(stop: threading.Event):
                     fee = abs(notional) * FEE_BPS; pnl = notional * realized_r - fee; eq += pnl
 
                     ticker = env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"
+                    # represent steps as BUY when invested, HOLD when cash; UI hides PnL for non-SELL anyway
+                    side = "BUY" if ticker != "CASH" else "HOLD"
                     qty = (abs(notional) / max(exec_price, 1e-6)) if ticker != "CASH" else 0.0
 
                     positions_value = abs(notional) if ticker != "CASH" else 0.0
@@ -907,8 +918,8 @@ def live_thread(stop: threading.Event):
                     insert_trade({
                         "session_id": backtest_session_id, "mode": "BACKTEST",
                         "ts_utc": now_utc().isoformat(), "ts_et": tznow.isoformat(),
-                        "side": "SIM", "ticker": ticker, "qty": qty, "fill_price": exec_price,
-                        "notional": abs(notional), "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
+                        "side": side, "ticker": ticker, "qty": round(qty, 6), "fill_price": exec_price,
+                        "notional": round(abs(notional), 2), "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
                         "risk_frac": risk, "position_before": 0.0, "position_after": 0.0,
                         "cost_basis_before": 0.0, "cost_basis_after": 0.0,
                         "realized_pnl": pnl, "realized_pnl_pct": (pnl/abs(notional) if notional!=0 else 0.0),
@@ -979,6 +990,15 @@ def metrics():
 
 @app.get("/stats")
 def stats():
+    # ensure stats are populated even if app just booted
+    if not TRAIN_STATS["last_time_utc"]:
+        try:
+            with get_db() as conn:
+                row = conn.execute("SELECT ts_utc, reward_mean, win_rate FROM train_events ORDER BY id DESC LIMIT 1").fetchone()
+            if row:
+                TRAIN_STATS["last_time_utc"] = row[0]; TRAIN_STATS["last_reward_mean"] = float(row[1]); TRAIN_STATS["last_win_rate"] = float(row[2])
+        except Exception:
+            pass
     with STATE_LOCK:
         s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity","block_risk","block_cash","paused")}
     return {"train": TRAIN_STATS, "state": s}
@@ -988,13 +1008,16 @@ _BENCH_CACHE: Dict[str, Dict[str, object]] = {}
 _BENCH_INFLIGHT: Set[str] = set()
 _BENCH_LOCK = threading.Lock()
 
-def _compute_and_store_bench(session: str, idx: List[pd.Timestamp], start_equity: float):
+def _bench_key(session: str, ticker: str) -> str:
+    return f"{session}:{ticker.upper()}"
+
+def _compute_and_store_bench(session: str, idx: List[pd.Timestamp], start_equity: float, ticker: str):
     try:
         t0 = idx[0].tz_localize(None)
         t1 = idx[-1].tz_localize(None)
         span_days = max(1, (t1 - t0).days)
         interval = "1m" if span_days <= 3 else "1d"
-        df = yf.download(BENCH_SYMBOL, start=t0, end=(t1 + pd.Timedelta(days=1)),
+        df = yf.download(ticker, start=t0, end=(t1 + pd.Timedelta(days=1)),
                          interval=interval, auto_adjust=True, progress=False)
         bench: List[dict] = []
         if isinstance(df, pd.DataFrame) and not df.empty:
@@ -1004,27 +1027,30 @@ def _compute_and_store_bench(session: str, idx: List[pd.Timestamp], start_equity
                 bench_vals = start_equity * (aligned / aligned.iloc[0])
                 bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(idx, bench_vals)]
         with _BENCH_LOCK:
-            _BENCH_CACHE[session] = {"ts": time.time(), "bench": bench}
+            _BENCH_CACHE[_bench_key(session, ticker)] = {"ts": time.time(), "bench": bench}
     except Exception:
         with _BENCH_LOCK:
-            _BENCH_CACHE[session] = {"ts": time.time(), "bench": []}
+            _BENCH_CACHE[_bench_key(session, ticker)] = {"ts": time.time(), "bench": []}
     finally:
         with _BENCH_LOCK:
-            _BENCH_INFLIGHT.discard(session)
+            _BENCH_INFLIGHT.discard(_bench_key(session, ticker))
 
-def _ensure_bench_async(session: str, idx: List[pd.Timestamp], start_equity: float):
+def _ensure_bench_async(session: str, idx: List[pd.Timestamp], start_equity: float, ticker: str):
+    key = _bench_key(session, ticker)
     with _BENCH_LOCK:
-        entry = _BENCH_CACHE.get(session)
+        entry = _BENCH_CACHE.get(key)
         if entry and (time.time() - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
             return
-        if session in _BENCH_INFLIGHT:
+        if key in _BENCH_INFLIGHT:
             return
-        _BENCH_INFLIGHT.add(session)
-    th = threading.Thread(target=_compute_and_store_bench, args=(session, idx, start_equity), daemon=True)
+        _BENCH_INFLIGHT.add(key)
+    th = threading.Thread(target=_compute_and_store_bench, args=(session, idx, start_equity, ticker), daemon=True)
     th.start()
 
 @app.get("/equity")
-def equity(window: str = "30d", session: Optional[str] = None, include_bench: int = Query(default=0, alias="bench")):
+def equity(window: str = "30d", session: Optional[str] = None,
+           include_bench: int = Query(default=1, alias="bench"),
+           bench_ticker: str = Query(default=BENCH_SYMBOL, alias="bench_ticker")):
     if session is None:
         with STATE_LOCK:
             session = STATE.get("session_id", "bootstrap")
@@ -1042,13 +1068,13 @@ def equity(window: str = "30d", session: Optional[str] = None, include_bench: in
     bench: List[dict] = []
     if include_bench:
         idx = pd.to_datetime([p["t"] for p in series])
+        key = _bench_key(session, bench_ticker)
         with _BENCH_LOCK:
-            entry = _BENCH_CACHE.get(session)
+            entry = _BENCH_CACHE.get(key)
             if entry and (time.time() - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
                 bench = entry.get("bench", [])
         if not bench:
-            # kick off background compute, return immediately
-            try: _ensure_bench_async(session, idx, float(series[0]["equity"]))
+            try: _ensure_bench_async(session, idx, float(series[0]["equity"]), bench_ticker)
             except Exception: pass
 
     return {"series": series, "bench": bench, "session": session}
@@ -1066,11 +1092,23 @@ def get_trades(limit: int = Query(default=100, ge=1, le=500), cursor: int = 0, s
     sql += " ORDER BY trade_id DESC LIMIT ?"; params.append(int(limit))
     with get_db() as conn:
         cur = conn.execute(sql, params)
-        rows = [dict(zip([c[0] for c in cur.description], r)) for r in cur.fetchall()]
+        cols = [c[0] for c in cur.description]
+        rows_raw = cur.fetchall()
+    # cap decimals before sending to UI
+    rows: List[dict] = []
+    for r in rows_raw:
+        d = dict(zip(cols, r))
+        d["qty"] = round(float(d.get("qty") or 0.0), 6)
+        d["fill_price"] = round(float(d.get("fill_price") or 0.0), 2)
+        d["notional"] = round(float(d.get("notional") or 0.0), 2)
+        d["risk_frac"] = round(float(d.get("risk_frac") or 0.0), 3)
+        d["equity_after"] = round(float(d.get("equity_after") or 0.0), 2)
+        d["realized_pnl"] = round(float(d.get("realized_pnl") or 0.0), 2)
+        rows.append(d)
     next_cursor = rows[0]["trade_id"] if rows else cursor
     return {"data": rows, "next_cursor": next_cursor}
 
-# ---- Protected admin/snapshot ----
+# ---- Protected admin/snapshot (endpoints intact) ----
 class ResetReq(BaseModel): password: str
 class PauseReq(BaseModel): password: str
 class TradeReq(BaseModel):
