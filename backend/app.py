@@ -2,7 +2,7 @@ import os, math, json, time, random, threading, sqlite3, shutil, requests, pathl
 from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set
 
 import numpy as np
 import pandas as pd
@@ -208,7 +208,7 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
                 return HistoryBundle(closes, rets, list(closes.columns), er, rsi, vz, synthetic=False)
         except Exception:
             pass
-    else:  # intraday
+    else:
         try:
             period = f"{max(5, min(60, int(intraday_days)))}d"
             dfi = yf.download(tickers[:min(MAX_TICKERS, 100)], period=period, interval="1m", auto_adjust=True,
@@ -233,7 +233,7 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
     returns_df = prices_df.pct_change().dropna(how="all")
     return HistoryBundle(prices_df, returns_df, list(prices_df.columns), None, None, None, synthetic=True)
 
-# ===================== ENV / PPO =====================
+# ===================== ENV / PPO (unchanged core) =====================
 @dataclass
 class EpState:
     t: int
@@ -510,7 +510,7 @@ class Portfolio:
         return (qty if is_buy else -min(abs(qty), prev_qty)), realized
 
 # ===================== BUILD ENV =====================
-def build_env() -> Tuple[Env, List[str], HistoryBundle]:
+def build_env() -> Tuple['Env', List[str], HistoryBundle]:
     tickers = list(FALLBACK_TICKERS)
     if AUTO_FETCH_SP500:
         try:
@@ -526,7 +526,7 @@ def build_env() -> Tuple[Env, List[str], HistoryBundle]:
     return env, list(env.tickers), bundle
 
 # ===================== ROLLOUT / SAVE =====================
-def rollout(env: Env, agent: PPO, steps: int):
+def rollout(env: 'Env', agent: 'PPO', steps: int):
     obs_buf, act_buf, logp_buf, rew_buf, val_buf = [],[],[],[],[]
     obs, s = env.reset()
     for _ in range(steps):
@@ -554,7 +554,7 @@ def rollout(env: Env, agent: PPO, steps: int):
 
 MODEL_PATH = os.path.join(MODEL_DIR, 'ppo.pt')
 
-def save_checkpoint(agent: PPO, tag: str):
+def save_checkpoint(agent: 'PPO', tag: str):
     ts = datetime.utcnow().strftime("%Y%m%d-%H%M%S")
     ckpt = os.path.join(MODEL_DIR, f"ppo-{tag}-{ts}.pt")
     tmp  = os.path.join(MODEL_DIR, f"ppo-tmp.pt")
@@ -763,7 +763,7 @@ def live_thread(stop: threading.Event):
                 if live_session_id is None:
                     start_live_session()
 
-                # Drain manual orders
+                # Manual orders
                 if portfolio is not None and ADMIN_QUEUE:
                     live_names = tickers[:MAX_LIVE_TICKERS]
                     snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True)
@@ -983,35 +983,45 @@ def stats():
         s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity","block_risk","block_cash","paused")}
     return {"train": TRAIN_STATS, "state": s}
 
+# ---- Benchmark caching (non-blocking) ----
 _BENCH_CACHE: Dict[str, Dict[str, object]] = {}
+_BENCH_INFLIGHT: Set[str] = set()
+_BENCH_LOCK = threading.Lock()
 
-def _cached_bench(session: str, series_idx: List[pd.Timestamp], start_equity: float) -> List[dict]:
-    now_ts = time.time()
-    entry = _BENCH_CACHE.get(session)
-    if entry and (now_ts - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
-        bench = entry.get("bench", [])
-        if isinstance(bench, list):
-            return bench
-    bench: List[dict] = []
+def _compute_and_store_bench(session: str, idx: List[pd.Timestamp], start_equity: float):
     try:
-        if not series_idx:
-            return bench
-        t0 = series_idx[0].tz_localize(None)
-        t1 = series_idx[-1].tz_localize(None)
+        t0 = idx[0].tz_localize(None)
+        t1 = idx[-1].tz_localize(None)
         span_days = max(1, (t1 - t0).days)
         interval = "1m" if span_days <= 3 else "1d"
-        df = yf.download(BENCH_SYMBOL, start=t0, end=(t1 + pd.Timedelta(days=1)), interval=interval,
-                         auto_adjust=True, progress=False)
+        df = yf.download(BENCH_SYMBOL, start=t0, end=(t1 + pd.Timedelta(days=1)),
+                         interval=interval, auto_adjust=True, progress=False)
+        bench: List[dict] = []
         if isinstance(df, pd.DataFrame) and not df.empty:
             px = df["Close"].dropna()
-            aligned = px.reindex(series_idx.tz_localize(None), method="pad")
+            aligned = px.reindex(pd.to_datetime(idx).tz_localize(None), method="pad")
             if not aligned.empty and aligned.iloc[0] > 0:
                 bench_vals = start_equity * (aligned / aligned.iloc[0])
-                bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(series_idx, bench_vals)]
+                bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(idx, bench_vals)]
+        with _BENCH_LOCK:
+            _BENCH_CACHE[session] = {"ts": time.time(), "bench": bench}
     except Exception:
-        bench = []
-    _BENCH_CACHE[session] = {"ts": now_ts, "bench": bench}
-    return bench
+        with _BENCH_LOCK:
+            _BENCH_CACHE[session] = {"ts": time.time(), "bench": []}
+    finally:
+        with _BENCH_LOCK:
+            _BENCH_INFLIGHT.discard(session)
+
+def _ensure_bench_async(session: str, idx: List[pd.Timestamp], start_equity: float):
+    with _BENCH_LOCK:
+        entry = _BENCH_CACHE.get(session)
+        if entry and (time.time() - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
+            return
+        if session in _BENCH_INFLIGHT:
+            return
+        _BENCH_INFLIGHT.add(session)
+    th = threading.Thread(target=_compute_and_store_bench, args=(session, idx, start_equity), daemon=True)
+    th.start()
 
 @app.get("/equity")
 def equity(window: str = "30d", session: Optional[str] = None, include_bench: int = Query(default=0, alias="bench")):
@@ -1028,13 +1038,19 @@ def equity(window: str = "30d", session: Optional[str] = None, include_bench: in
         return {"series": series, "bench": [], "session": session}
 
     series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None][-2000:]
+
     bench: List[dict] = []
     if include_bench:
-        try:
-            idx = pd.to_datetime([p["t"] for p in series])
-            bench = _cached_bench(session, idx, float(series[0]["equity"]))
-        except Exception:
-            bench = []
+        idx = pd.to_datetime([p["t"] for p in series])
+        with _BENCH_LOCK:
+            entry = _BENCH_CACHE.get(session)
+            if entry and (time.time() - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
+                bench = entry.get("bench", [])
+        if not bench:
+            # kick off background compute, return immediately
+            try: _ensure_bench_async(session, idx, float(series[0]["equity"]))
+            except Exception: pass
+
     return {"series": series, "bench": bench, "session": session}
 
 # ---- trades (public) ----
@@ -1090,7 +1106,8 @@ def admin_reset(req: ResetReq, _: None = Depends(require_key)):
     except Exception: pass
     with get_db() as conn:
         conn.execute(SCHEMA_SQL); conn.execute(TRAIN_SQL); conn.commit()
-    _BENCH_CACHE.clear()
+    with _BENCH_LOCK:
+        _BENCH_CACHE.clear(); _BENCH_INFLIGHT.clear()
     REINIT_EVENT.set()
     with STATE_LOCK:
         STATE.update({
