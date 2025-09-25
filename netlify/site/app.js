@@ -11,7 +11,7 @@ const pct = (x) => `${(Number(x || 0) * 100).toFixed(2)}%`;
 // generic fetch
 async function getJSON(path) {
   const res = await fetch(`${API_BASE}${path}`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error(`${res.status}`);
   return res.json();
 }
 async function postJSON(path, body) {
@@ -20,24 +20,19 @@ async function postJSON(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
   });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) throw new Error(`${res.status}`);
   return res.json();
 }
 
-// -------- API warm-up to avoid 504s on cold starts --------
-let ready = false;
+// warm up
 async function waitForApiReady() {
   for (let i = 0; i < 8; i++) {
-    try {
-      const r = await fetch(`${API_BASE}/healthz`, { cache: "no-store" });
-      if (r.ok) { ready = true; return; }
-    } catch {}
-    await new Promise(r => setTimeout(r, 1500));
+    try { if ((await fetch(`${API_BASE}/healthz`)).ok) return; } catch {}
+    await new Promise(r => setTimeout(r, 1000));
   }
-  // continue anyway; subsequent calls will retry on next refresh loop
 }
 
-// admin: reset/pause/resume/params
+// admin buttons (unchanged)
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password:");
   if (!pwd) return;
@@ -56,14 +51,10 @@ document.getElementById("resumeBtn")?.addEventListener("click", async () => {
 });
 document.getElementById("paramsBtn")?.addEventListener("click", async () => {
   try {
-    const data = await getJSON("/admin/params");
+    const data = await getJSON("/stats");
     const box = document.getElementById("paramsBox");
-    if (box) {
-      box.style.display = "block";
-      box.textContent = JSON.stringify(data, null, 2);
-    } else {
-      alert(JSON.stringify(data, null, 2));
-    }
+    if (box) { box.style.display = "block"; box.textContent = JSON.stringify(data, null, 2); }
+    else { alert(JSON.stringify(data, null, 2)); }
   } catch (e) { alert(e.message); }
 });
 
@@ -90,54 +81,40 @@ async function loadMetrics() {
   document.getElementById("trades").textContent = Number(m.today_trades || 0);
   document.getElementById("universe").textContent = Number(m.universe || 0);
   document.getElementById("dd").textContent = pct(m.max_drawdown);
-
   document.getElementById("blockRisk").textContent = m.block_risk != null ? (Number(m.block_risk).toFixed(3)) : "–";
   document.getElementById("blockCash").textContent = m.block_cash != null ? fmtUSD(m.block_cash) : "–";
-
   document.getElementById("cash").textContent = fmtUSD(m.cash);
   document.getElementById("invested").textContent = fmtUSD(m.positions_value);
   document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
 }
 
-// equity chart with cached/occasional benchmark fetch
+// equity
 let eqChart;
 let lastBenchAt = 0;
-
 async function loadEquity() {
-  const wantBench = (Date.now() - lastBenchAt) > 60_000; // once a minute
+  const wantBench = (Date.now() - lastBenchAt) > 60_000;
   const { series = [], bench = [] } = await getJSON(`/equity?bench=${wantBench ? 1 : 0}`);
   if (wantBench) lastBenchAt = Date.now();
-
   const equityPts = series.map(p => ({ x: p.t, y: Number(p.equity) }));
   const benchPts  = (bench || []).map(p => ({ x: p.t, y: Number(p.equity) }));
-
   if (!eqChart) {
     const ctx = document.getElementById("equityChart").getContext("2d");
     eqChart = new Chart(ctx, {
       type: "line",
-      data: {
-        datasets: [
-          { label: "Equity", data: equityPts, tension: 0.25, pointRadius: 0 },
-          { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderColor: "#ff6b6b" }
-        ]
-      },
+      data: { datasets: [
+        { label: "Equity", data: equityPts, tension: 0.25, pointRadius: 0 },
+        { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderColor: "#ff6b6b" }
+      ]},
       options: {
-        responsive: true,
-        animation: false,
-        parsing: true,
+        responsive: true, animation: false, parsing: true,
         interaction: { mode: "nearest", intersect: false },
-        scales: {
-          x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" } },
-          y: { beginAtZero: false }
-        },
+        scales: { x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" } }, y: { beginAtZero: false } },
         plugins: { legend: { display: true } }
       }
     });
   } else {
     eqChart.data.datasets[0].data = equityPts;
-    if (benchPts.length) {
-      eqChart.data.datasets[1].data = benchPts;
-    }
+    if (benchPts.length) eqChart.data.datasets[1].data = benchPts;
     eqChart.update();
   }
 }
@@ -177,7 +154,6 @@ async function loadStats() {
   const state = s.state || {}, train = s.train || {};
   const reward = state.train_reward_mean ?? train.last_reward_mean ?? 0;
   const win    = state.train_win_rate   ?? train.last_win_rate   ?? 0;
-
   document.getElementById("rewardMean").textContent = Number(reward).toFixed(4);
   document.getElementById("winRate").textContent = `${(Number(win) * 100).toFixed(1)}%`;
   document.getElementById("lastTrain").textContent =
@@ -189,7 +165,6 @@ async function refresh() {
   try {
     await Promise.all([loadMetrics(), loadEquity(), loadTrades(), loadStats()]);
   } catch (e) {
-    // swallow transient 5xx/504s; console only
     console.warn("UI refresh error:", e.message);
   } finally {
     setTimeout(refresh, 5000);
@@ -197,7 +172,4 @@ async function refresh() {
 }
 
 // boot
-(async () => {
-  await waitForApiReady();
-  refresh();
-})();
+(async () => { await waitForApiReady(); refresh(); })();
