@@ -45,8 +45,12 @@ document.getElementById("paramsBtn")?.addEventListener("click", async () => {
   try {
     const data = await getJSON("/admin/params");
     const box = document.getElementById("paramsBox");
-    box.style.display = "block";
-    box.textContent = JSON.stringify(data, null, 2);
+    if (box) {
+      box.style.display = "block";
+      box.textContent = JSON.stringify(data, null, 2);
+    } else {
+      alert(JSON.stringify(data, null, 2));
+    }
   } catch (e) { alert(e.message); }
 });
 
@@ -54,9 +58,13 @@ document.getElementById("paramsBtn")?.addEventListener("click", async () => {
 document.getElementById("tradeBtn")?.addEventListener("click", async () => {
   const password = prompt("Admin password for manual trade:");
   if (!password) return;
-  const side = document.getElementById("tradeSide").value;
-  const ticker = document.getElementById("tradeTicker").value.trim().toUpperCase();
-  const notional = parseFloat(document.getElementById("tradeNotional").value || "0");
+  const sideEl = document.getElementById("tradeSide");
+  const tickerEl = document.getElementById("tradeTicker");
+  const notionalEl = document.getElementById("tradeNotional");
+  if (!sideEl || !tickerEl) return alert("Missing inputs in the page.");
+  const side = sideEl.value;
+  const ticker = tickerEl.value.trim().toUpperCase();
+  const notional = parseFloat((notionalEl?.value ?? "0") || "0");
   if (!ticker || !side) return alert("Provide side and ticker.");
   try {
     await postJSON("/admin/trade", { password, side, ticker, notional: isNaN(notional)?undefined:notional });
@@ -96,7 +104,7 @@ async function loadEquity() {
       data: {
         datasets: [
           { label: "Equity", data: equityPts, tension: 0.25, pointRadius: 0 },
-          { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderColor: "#ff6b6b" }
+          { label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderDash: [4,3] }
         ]
       },
       options: {
@@ -113,7 +121,11 @@ async function loadEquity() {
     });
   } else {
     eqChart.data.datasets[0].data = equityPts;
-    eqChart.data.datasets[1].data = benchPts;
+    if (eqChart.data.datasets[1]) {
+      eqChart.data.datasets[1].data = benchPts;
+    } else {
+      eqChart.data.datasets.push({ label: "Benchmark (SPY)", data: benchPts, tension: 0.25, pointRadius: 0, borderDash: [4,3] });
+    }
     eqChart.update();
   }
 }
