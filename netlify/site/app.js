@@ -26,8 +26,8 @@ async function postJSON(path, body) {
 
 // warm up
 async function waitForApiReady() {
-  for (let i = 0; i < 8; i++) {
-    try { if ((await fetch(`${API_BASE}/healthz`)).ok) return; } catch {}
+  for (let i = 0; i < 10; i++) {
+    try { const r = await fetch(`${API_BASE}/healthz`); if (r.ok) return; } catch {}
     await new Promise(r => setTimeout(r, 1000));
   }
 }
@@ -88,15 +88,17 @@ async function loadMetrics() {
   document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
 }
 
-// equity (with cached benchmark every 60s)
+// equity (non-blocking benchmark: server computes in background)
 let eqChart;
 let lastBenchAt = 0;
 async function loadEquity() {
   const wantBench = (Date.now() - lastBenchAt) > 60_000;
   const { series = [], bench = [] } = await getJSON(`/equity?bench=${wantBench ? 1 : 0}`);
   if (wantBench) lastBenchAt = Date.now();
+
   const equityPts = series.map(p => ({ x: p.t, y: Number(p.equity) }));
   const benchPts  = (bench || []).map(p => ({ x: p.t, y: Number(p.equity) }));
+
   if (!eqChart) {
     const ctx = document.getElementById("equityChart").getContext("2d");
     eqChart = new Chart(ctx, {
