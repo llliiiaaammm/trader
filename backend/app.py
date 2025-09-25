@@ -4,11 +4,6 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
 
-# ---- keep memory use low on small instances (Render Free, etc.)
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
-
 import numpy as np
 import pandas as pd
 import pytz
@@ -16,16 +11,12 @@ import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from fastapi import FastAPI, Header, HTTPException, Depends, Query
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi import Response
 from pydantic import BaseModel
 import uvicorn
-try:
-    torch.set_num_threads(1)
-except Exception:
-    pass
 
 # ===================== CONFIG =====================
 API_KEY = os.getenv("API_KEY", "changeme")
@@ -43,18 +34,18 @@ BACKTEST_WHEN_CLOSED = os.getenv("BACKTEST_WHEN_CLOSED", "true").lower() == "tru
 
 # Always-on training
 CONTINUOUS_TRAIN = os.getenv("CONTINUOUS_TRAIN", "true").lower() == "true"
-CONTINUOUS_ROLLOUT_STEPS = int(os.getenv("CONTINUOUS_ROLLOUT_STEPS", "512"))  # lighter by default
-CONTINUOUS_SLEEP_SECS = int(os.getenv("CONTINUOUS_SLEEP_SECS", "15"))
+CONTINUOUS_ROLLOUT_STEPS = int(os.getenv("CONTINUOUS_ROLLOUT_STEPS", "1024"))
+CONTINUOUS_SLEEP_SECS = int(os.getenv("CONTINUOUS_SLEEP_SECS", "10"))
 CHECKPOINT_POLL_SECS = int(os.getenv("CHECKPOINT_POLL_SECS", "60"))
 
-# Training data granularity (tuned to avoid OOM on 512MB)
+# Training data granularity
 TRAIN_INTERVAL = os.getenv("TRAIN_INTERVAL", "1d")  # '1d' or '1m'
-HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "2"))
-INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "10"))
+HISTORY_YEARS = int(os.getenv("HISTORY_YEARS", "3"))
+INTRADAY_PERIOD_DAYS = int(os.getenv("INTRADAY_PERIOD_DAYS", "30"))
 WINDOW = int(os.getenv("WINDOW", "30"))
 AUTO_FETCH_SP500 = os.getenv("AUTO_FETCH_SP500", "true").lower() == "true"
-MAX_TICKERS = int(os.getenv("MAX_TICKERS", "60"))
-MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "40"))
+MAX_TICKERS = int(os.getenv("MAX_TICKERS", "500"))
+MAX_LIVE_TICKERS = int(os.getenv("MAX_LIVE_TICKERS", "100"))
 
 # Risk sizing
 EPISODE_BLOCK = int(os.getenv("EPISODE_BLOCK", "100"))
@@ -72,6 +63,7 @@ ALLOW_SHORT = os.getenv("ALLOW_SHORT", "false").lower() == "true"
 
 # Benchmark line
 BENCH_SYMBOL = os.getenv("BENCH_SYMBOL", "SPY")
+BENCH_CACHE_TTL = int(os.getenv("BENCH_CACHE_TTL", "600"))  # seconds
 
 # Optional vendors (reserved)
 POLYGON_API_KEY = os.getenv("POLYGON_API_KEY", "")
@@ -220,10 +212,10 @@ class HistoryBundle:
 # Generic chunked downloader for daily bars
 def _download_daily_chunked(tickers: List[str], start: datetime, end: datetime) -> Tuple[pd.DataFrame, pd.DataFrame]:
     frames_p, frames_v = [], []
-    for i in range(0, len(tickers), 50):  # keep peak RAM down
-        chunk = tickers[i:i+50]
+    for i in range(0, len(tickers), 100):
+        chunk = tickers[i:i+100]
         dfi = yf.download(chunk, start=start, end=end, interval="1d", auto_adjust=True,
-                          progress=False, group_by="column", threads=True)
+                          progress=False, group_by="column", threads=True, timeout=8)
         if isinstance(dfi.columns, pd.MultiIndex):
             frames_p.append(dfi["Close"]) ; frames_v.append(dfi.get("Volume"))
         else:
@@ -250,11 +242,11 @@ def fetch_history(tickers: List[str], interval: str = "1d", years: int = 3, intr
                 return HistoryBundle(closes, rets, list(closes.columns), er, rsi, vz, synthetic=False)
         except Exception:
             pass
-    else:  # 1m intraday
+    else:
         try:
             period = f"{max(5, min(60, int(intraday_days)))}d"
             dfi = yf.download(tickers[:min(MAX_TICKERS, 100)], period=period, interval="1m", auto_adjust=True,
-                              progress=False, group_by="column", threads=True)
+                              progress=False, group_by="column", threads=True, timeout=8)
             closes = dfi["Close"] if isinstance(dfi.columns, pd.MultiIndex) else dfi
             closes = closes.dropna(how="all")
             rets = closes.pct_change().dropna(how="all")
@@ -507,6 +499,9 @@ STATE = {
 STATE_LOCK = threading.Lock()
 REINIT_EVENT = threading.Event()
 TRAIN_STATS = {"last_reward_mean": 0.0, "last_win_rate": 0.0, "last_time_utc": None}
+
+# cache for benchmark series per session to avoid 504s
+_BENCH_CACHE: Dict[str, Dict[str, object]] = {}  # session_id -> {"ts": epoch, "bench": list}
 
 # ===================== PORTFOLIO =====================
 class Portfolio:
@@ -815,7 +810,7 @@ def live_thread(stop: threading.Event):
                 # Drain manual orders if any
                 if portfolio is not None and ADMIN_QUEUE:
                     live_names = tickers[:MAX_LIVE_TICKERS]
-                    snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True)
+                    snap = yf.download(live_names, period="1d", interval="1m", progress=False, auto_adjust=True, timeout=8)
                     closes = snap["Close"] if isinstance(snap.columns, pd.MultiIndex) else snap
                     latest = closes.iloc[-1].dropna()
                     while ADMIN_QUEUE:
@@ -849,7 +844,7 @@ def live_thread(stop: threading.Event):
 
                 # Pull latest minute data
                 live_names = tickers[:MAX_LIVE_TICKERS]
-                data = yf.download(live_names, period="2d", interval="1m", progress=False, auto_adjust=True)
+                data = yf.download(live_names, period="2d", interval="1m", progress=False, auto_adjust=True, timeout=8)
                 closes = data["Close"] if isinstance(data.columns, pd.MultiIndex) else data
                 latest = closes.iloc[-1].dropna()
                 if last_prices is None:
@@ -993,10 +988,20 @@ app.add_middleware(
     allow_credentials=False, allow_methods=["*"], allow_headers=["*"]
 )
 
-def require_key(authorization: Optional[str] = Header(default=None)):
-    if not authorization or not authorization.lower().startswith("bearer "):
-        raise HTTPException(401, detail="Missing bearer token")
-    token = authorization.split()[1]
+def require_key(
+    request: Request,
+    authorization: Optional[str] = Header(default=None),
+    x_api_key: Optional[str] = Header(default=None),
+    key_q: Optional[str] = Query(default=None, alias="key")
+):
+    """Accept Bearer token, X-API-Key, or ?key=...  (more tolerant for proxies)."""
+    token = None
+    if authorization and authorization.lower().startswith("bearer "):
+        token = authorization.split()[1]
+    elif x_api_key:
+        token = x_api_key
+    elif key_q:
+        token = key_q
     if token != API_KEY:
         raise HTTPException(403, detail="Bad token")
 
@@ -1027,8 +1032,45 @@ def stats(_: None = Depends(require_key)):
         s = {k: STATE.get(k) for k in ("train_reward_mean","train_win_rate","last_train_utc","universe","max_drawdown","today_trades","cash","positions_value","unrealized_pnl","equity","block_risk","block_cash","paused")}
     return {"train": TRAIN_STATS, "state": s}
 
+def _cached_bench(session: str, series_idx: List[pd.Timestamp], start_equity: float) -> List[dict]:
+    """Return cached benchmark for session if fresh, else compute and cache."""
+    now_ts = time.time()
+    entry = _BENCH_CACHE.get(session)
+    if entry and (now_ts - float(entry.get("ts", 0))) < BENCH_CACHE_TTL:
+        bench = entry.get("bench", [])
+        if isinstance(bench, list):
+            return bench
+
+    # compute (best-effort, fast timeout)
+    bench: List[dict] = []
+    try:
+        if not series_idx:
+            return bench
+        t0 = series_idx[0].tz_localize(None)
+        t1 = series_idx[-1].tz_localize(None)
+        span_days = max(1, (t1 - t0).days)
+        interval = "1m" if span_days <= 3 else "1d"
+        df = yf.download(BENCH_SYMBOL, start=t0, end=(t1 + pd.Timedelta(days=1)), interval=interval,
+                         auto_adjust=True, progress=False, timeout=6)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            px = df["Close"].dropna()
+            aligned = px.reindex(series_idx.tz_localize(None), method="pad")
+            if not aligned.empty and aligned.iloc[0] > 0:
+                bench_vals = start_equity * (aligned / aligned.iloc[0])
+                bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(series_idx, bench_vals)]
+    except Exception:
+        bench = []
+
+    _BENCH_CACHE[session] = {"ts": now_ts, "bench": bench}
+    return bench
+
 @app.get("/equity")
-def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends(require_key)):
+def equity(
+    window: str = "30d",
+    session: Optional[str] = None,
+    include_bench: int = Query(default=0, alias="bench"),
+    _: None = Depends(require_key)
+):
     if session is None:
         with STATE_LOCK:
             session = STATE.get("session_id", "bootstrap")
@@ -1044,45 +1086,14 @@ def equity(window: str = "30d", session: Optional[str] = None, _: None = Depends
     # Equity series
     series = [{"t": r[0], "equity": float(r[1])} for r in rows if r[1] is not None][-2000:]
 
-    # Benchmark series (SPY by default) normalized to starting equity
-    def _to_naive(ts):
+    # Benchmark (throttled + cached)
+    bench: List[dict] = []
+    if include_bench:
         try:
-            return ts.tz_convert(None)
-        except Exception:
-            try:
-                return ts.tz_localize(None)
-            except Exception:
-                return ts
-
-    try:
-        t0 = _to_naive(pd.to_datetime(series[0]["t"]))
-        t1 = _to_naive(pd.to_datetime(series[-1]["t"]))
-        span_days = max(1, (t1 - t0).days)
-        interval = "1m" if span_days <= 3 else "1d"
-        df = yf.download(BENCH_SYMBOL, start=t0, end=t1 + pd.Timedelta(days=1),
-                         interval=interval, auto_adjust=True, progress=False)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            px = df["Close"].dropna()
             idx = pd.to_datetime([p["t"] for p in series])
-            # make idx naive to match px
-            try:
-                idx = idx.tz_convert(None)
-            except Exception:
-                try:
-                    idx = idx.tz_localize(None)
-                except Exception:
-                    pass
-            aligned = px.reindex(idx, method="pad")
-            if not aligned.empty and float(aligned.iloc[0]) > 0:
-                start_eq = float(series[0]["equity"])
-                bench_vals = start_eq * (aligned / float(aligned.iloc[0]))
-                bench = [{"t": t.isoformat(), "equity": float(v)} for t, v in zip(idx, bench_vals)]
-            else:
-                bench = []
-        else:
+            bench = _cached_bench(session, idx, float(series[0]["equity"]))
+        except Exception:
             bench = []
-    except Exception:
-        bench = []
 
     return {"series": series, "bench": bench, "session": session}
 
@@ -1120,7 +1131,6 @@ class TradeReq(BaseModel):
 def admin_reset(req: ResetReq, _: None = Depends(require_key)):
     if req.password != API_KEY and req.password != os.getenv("ADMIN_RESET_PASSWORD", "please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
-    # hard reset
     with STATE_LOCK: STATE['status'] = STATE['mode'] = 'resetting'
     try:
         if os.path.exists(MODEL_PATH): os.remove(MODEL_PATH)
@@ -1139,6 +1149,7 @@ def admin_reset(req: ResetReq, _: None = Depends(require_key)):
             "today_pnl": 0.0,"today_trades": 0,"max_drawdown": 0.0,"session_id": "bootstrap","peak_equity": 0.0,
             "block_risk": None, "block_cash": None
         })
+    _BENCH_CACHE.clear()
     return {"ok": True, "message": "Reset complete"}
 
 @app.post("/admin/pause")
