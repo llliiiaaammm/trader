@@ -18,7 +18,7 @@ import torch.nn as nn
 import torch.optim as optim
 torch.set_num_threads(int(os.getenv("TORCH_THREADS", "1")))
 
-from fastapi import FastAPI, Header, HTTPException, Depends, Query
+from fastapi import FastAPI, Header, HTTPException, Depends, Query, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
@@ -870,18 +870,55 @@ def admin_trade(req:TradeReq,_:None=Depends(require_key)):
     ADMIN_QUEUE.append(AdminOrder(side=side,ticker=req.ticker.upper(),notional=req.notional,qty=req.qty))
     return {"ok":True,"queued":True}
 
-# ===== Mirror endpoints under /api so Netlify/Render proxies work =====
-@app.get("/api/healthz")       ;   def _a(): return healthz()
-@app.head("/api/healthz")      ;   def _b(): return healthz_head()
-@app.get("/api/mode")          ;   def _c(): return mode()
-@app.get("/api/metrics")       ;   def _d(): return metrics()
-@app.get("/api/stats")         ;   def _e(): return stats()
-@app.get("/api/trades")        ;   def _f(limit:int=Query(100,ge=1,le=500), cursor:int=0, session:Optional[str]=None): return trades(limit,cursor,session)
-@app.get("/api/equity")        ;   def _g(window:str="30d", session:Optional[str]=None, bench:Optional[str]=None): return equity(window,session,bench)
-@app.post("/api/admin/reset")  ;   def _h(req:ResetReq,_:None=Depends(require_key)): return admin_reset(req,_)
-@app.post("/api/admin/pause")  ;   def _i(req:PauseReq,_:None=Depends(require_key)): return admin_pause(req,_)
-@app.post("/api/admin/resume") ;   def _j(req:PauseReq,_:None=Depends(require_key)): return admin_resume(req,_)
-@app.post("/api/admin/trade")  ;   def _k(req:TradeReq,_:None=Depends(require_key)): return admin_trade(req,_)
+# ===== Mirror endpoints under /api via a router (valid Python) =====
+api = APIRouter()
+
+@api.get("/healthz")
+def healthz_api(): 
+    return healthz()
+
+@api.head("/healthz")
+def healthz_head_api(): 
+    return healthz_head()
+
+@api.get("/mode")
+def mode_api():
+    return mode()
+
+@api.get("/metrics")
+def metrics_api():
+    return metrics()
+
+@api.get("/stats")
+def stats_api():
+    return stats()
+
+@api.get("/trades")
+def trades_api(limit: int = Query(100, ge=1, le=500), cursor: int = 0, session: Optional[str] = None):
+    return trades(limit, cursor, session)
+
+@api.get("/equity")
+def equity_api(window: str = "30d", session: Optional[str] = None, bench: Optional[str] = None):
+    return equity(window, session, bench)
+
+@api.post("/admin/reset")
+def admin_reset_api(req: ResetReq, _auth: None = Depends(require_key)):
+    return admin_reset(req)  # underlying fn checks password; dependency enforces auth header if you use it
+
+@api.post("/admin/pause")
+def admin_pause_api(req: PauseReq, _auth: None = Depends(require_key)):
+    return admin_pause(req)
+
+@api.post("/admin/resume")
+def admin_resume_api(req: PauseReq, _auth: None = Depends(require_key)):
+    return admin_resume(req)
+
+@api.post("/admin/trade")
+def admin_trade_api(req: TradeReq, _auth: None = Depends(require_key)):
+    return admin_trade(req)
+
+# Attach router
+app.include_router(api, prefix="/api")
 
 # ===================== BOOT =====================
 STOP=threading.Event()
