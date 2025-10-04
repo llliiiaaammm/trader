@@ -1,14 +1,13 @@
-/* ===== Backend host selection =====
-   Netlify proxy uses /api prefix.
-   Direct Render backend is served at root (no /api).
-*/
+/* ===== Backend host selection ===== */
 const HOSTS = [];
-HOSTS.push({ base: location.origin.replace(/\/$/, ""), prefix: "/api" }); // Netlify rewrite
+// Netlify proxy: /api/xxx -> your backend
+HOSTS.push({ base: location.origin.replace(/\/$/, ""), prefix: "/api" });
+// Direct Render backend (no /api prefix)
 if (typeof window !== "undefined" && window.API_FALLBACK) {
-  HOSTS.push({ base: String(window.API_FALLBACK).replace(/\/$/, ""), prefix: "" }); // direct FastAPI
+  HOSTS.push({ base: String(window.API_FALLBACK).replace(/\/$/, ""), prefix: "" });
 }
 
-// Waking badge (unchanged)
+/* Waking badge */
 let serverSleeping = false;
 function setServerSleeping(flag) {
   serverSleeping = !!flag;
@@ -23,15 +22,15 @@ function setServerSleeping(flag) {
   badge.id = "serverStatus";
   badge.style.cssText =
     "position:absolute;right:18px;top:12px;padding:6px 10px;border-radius:8px;background:#3b3b3b;color:#ffd37a;font-size:12px;display:none;z-index:50;";
-  badge.textContent = "Waking server… (free instance)";
   document.body.appendChild(badge);
 })();
 
-// ==== resilient fetch with fallback hosts, per-host timeout, and backoff ====
+/* Robust fetch with fallback + timeout */
 async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9000 } = {}) {
+  setServerSleeping(true);
   let lastErr;
   for (const host of HOSTS) {
-    const url = host.base + host.prefix + path;     // <— IMPORTANT: fallback has empty prefix
+    const url = host.base + host.prefix + path;   // NOTE: fallback prefix is "" (no /api)
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -43,16 +42,24 @@ async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9
         signal: ctrl.signal
       });
       clearTimeout(t);
-      if (res.ok) return res.json();
+      if (res.ok) {
+        setServerSleeping(false);
+        return res.json();
+      }
       lastErr = new Error(`${res.status}`);
-      continue; // try next host
+      // try next host
     } catch (e) {
       lastErr = e;
-      continue; // try next host
+      // try next host
     }
   }
+  setServerSleeping(true); // still sleeping/unreachable
   throw lastErr || new Error("unreachable");
 }
+
+// Use the new helper everywhere app.js was calling your old getJSON/postJSON:
+const getJSON  = (p) => fetchJSONWithFallback(p);
+const postJSON = (p, body) => fetchJSONWithFallback(p, { method: "POST", body });
 
 // adaptive poll wrapper: backs off when failing (for sleepy servers)
 function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
