@@ -78,7 +78,11 @@ document.getElementById("benchLabel")?.addEventListener("click", async () => {
 // ---------- metrics ----------
 async function loadMetrics() {
   const m = await getJSON("/metrics");
-  document.getElementById("mode").innerHTML = `<b>${m.status || "idle"}</b>`;
+  const modeText = (m.mode || "idle").toUpperCase();
+  const trainerBadge = (m.status === "training")
+    ? ` <span style="font-size:10px;padding:2px 6px;border:1px solid #666;border-radius:999px;opacity:.8">training</span>`
+    : "";
+  document.getElementById("mode").innerHTML = `<b>${modeText}</b>${trainerBadge}`;
   document.getElementById("equity").textContent = fmtUSD(m.equity);
   document.getElementById("pnl").textContent = fmtUSD(m.today_pnl);
   document.getElementById("trades").textContent = Number(m.today_trades || 0);
