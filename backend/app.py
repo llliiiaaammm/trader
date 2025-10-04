@@ -375,6 +375,31 @@ def build_env() -> Tuple['Env', List[str], HistoryBundle]:
         STATE["universe"] = env.N_assets
     return env, list(env.tickers), bundle
 
+def build_env_safe() -> Tuple['Env', List[str], HistoryBundle]:
+    """
+    Always returns a non-empty Env. Falls back to synthetic if anything fails
+    or if we end up with 0 assets.
+    """
+    try:
+        env, tickers, bundle = build_env()
+        if getattr(env, "N_assets", 0) >= 1 and len(getattr(env, "valid", [])) >= 1:
+            return env, tickers, bundle
+    except Exception:
+        pass
+
+    # Hard fallback: guaranteed synthetic
+    idx = pd.date_range(end=now_utc().date(), periods=240, freq="D")
+    synth_cols = ["AAPL", "MSFT", "AMZN"]
+    synth = {c: 100 + np.cumsum(np.random.normal(0, 1, len(idx))) for c in synth_cols}
+    prices = pd.DataFrame(synth, index=idx)
+    returns = prices.pct_change().dropna(how="all")
+    bundle = HistoryBundle(prices=prices, returns=returns, tickers=synth_cols,
+                           ema_ratio=None, rsi=None, synthetic=True)
+    env = Env(bundle, WINDOW, FEE_BPS)
+    with STATE_LOCK:
+        STATE["universe"] = env.N_assets
+    return env, synth_cols, bundle
+
 # ===================== ROLLOUT/TRAINER =====================
 def rollout(env: Env, agent, steps: int):
     obs_buf, act_buf, logp_buf, rew_buf, val_buf = [],[],[],[],[]
@@ -414,7 +439,7 @@ def save_checkpoint(agent, tag: str):
         shutil.copy2(tmp, MODEL_PATH)
 
 def trainer_thread(stop: threading.Event):
-    env, _, _ = build_env()
+    env, _, _ = build_env_safe()
     input_dim  = infer_input_dim(env)
     n_actions  = env.N_assets + 1
     agent = PPO(input_dim, n_actions, PPO_CFG)
@@ -469,7 +494,7 @@ def insert_trade(row: Dict):
         conn.commit()
 
 def live_thread(stop: threading.Event):
-    env, tickers, _ = build_env()
+    env, tickers, _ = build_env_safe()
     input_dim  = infer_input_dim(env)
     n_actions  = env.N_assets + 1
     agent = PPO(input_dim, n_actions, PPO_CFG)
@@ -556,7 +581,7 @@ def live_thread(stop: threading.Event):
         nonlocal env, tickers, input_dim, n_actions, agent
         nonlocal portfolio, day_risk, day_cash, live_session_id
         nonlocal last_prices, intraday_buf, decision, today_et
-        env, tickers, _ = build_env()
+        env, tickers, _ = build_env_safe()
         input_dim = infer_input_dim(env)
         n_actions = env.N_assets + 1
         agent = PPO(input_dim, n_actions, PPO_CFG)
