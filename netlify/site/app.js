@@ -1,12 +1,12 @@
 const API_BASE = "/api";
 
-// Hide removed controls (functionality still exists server-side)
-["pauseBtn", "resumeBtn", "manualBtn"].forEach((id) => {
+// Hide buttons you wanted gone in the UI (server endpoints still exist)
+["pauseBtn", "resumeBtn", "manualBtn", "manualTradeBtn"].forEach((id) => {
   const el = document.getElementById(id);
   if (el) el.style.display = "none";
 });
 
-// ---------- helpers ----------
+// helpers
 const fmtUSD = (n) => {
   const v = Number(n || 0);
   const s = `$${Math.abs(v).toFixed(2)}`;
@@ -15,55 +15,39 @@ const fmtUSD = (n) => {
 const pct = (x) => `${(Number(x || 0) * 100).toFixed(2)}%`;
 const r6 = (x) => Number(x || 0).toFixed(6);
 
-// small fetch with retry/backoff to cope with free-instance cold starts
-async function getJSON(path, { retries = 2 } = {}) {
+// fetch with tiny retry for cold starts
+async function getJSON(path) {
   const url = `${API_BASE}${path}`;
-  let last;
-  for (let i = 0; i <= retries; i++) {
+  for (let i = 0; i < 1; i++) {
     try {
       const r = await fetch(url, { cache: "no-store" });
       if (r.ok) return r.json();
-      last = r.status;
-    } catch (e) {
-      last = e.message;
-    }
-    await new Promise((r) => setTimeout(r, 500 * (i + 1)));
+    } catch {}
+    await new Promise((r) => setTimeout(r, 250));
   }
-  throw new Error(String(last || "fetch failed"));
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
 }
-
 async function postJSON(path, body) {
-  const r = await fetch(`${API_BASE}${path}`, {
+  const res = await fetch(`${API_BASE}${path}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body || {})
   });
-  if (!r.ok) throw new Error(`${r.status}`);
-  return r.json();
+  if (!res.ok) throw new Error(`${res.status}`);
+  return res.json();
 }
 
-// ---------- wake gate (prevents spamming 503s) ----------
-async function waitForReady() {
-  const t0 = Date.now();
-  while (Date.now() - t0 < 60000) { // 60s max
-    try {
-      const h = await getJSON("/healthz", { retries: 0 });
-      if (h && h.ok) return true;
-    } catch {}
-    await new Promise((r) => setTimeout(r, 800));
-  }
-  return false;
-}
-
-// ---------- admin: Reset (only one left) ----------
+// Admin: only Reset visible
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
-  const pwd = prompt("Admin password to reset all state:");
+  const pwd = prompt("Admin password to reset all model & trades:");
   if (!pwd) return;
-  try { await postJSON("/admin/reset", { password: pwd }); alert("Reset complete"); }
+  try { await postJSON("/admin/reset", { password: pwd }); alert("Reset complete."); }
   catch (e) { alert(`Reset failed: ${e.message}`); }
 });
 
-// ---------- benchmark control ----------
+// Benchmark control
 const BENCH_KEY = "benchSymbol";
 const benchSymbol = () => localStorage.getItem(BENCH_KEY) || "SPY";
 const setBench = (s) => localStorage.setItem(BENCH_KEY, (s || "SPY").toUpperCase());
@@ -75,27 +59,36 @@ document.getElementById("benchLabel")?.addEventListener("click", async () => {
   await loadEquity(true);
 });
 
-// ---------- metrics ----------
+// metrics
 async function loadMetrics() {
   const m = await getJSON("/metrics");
-  const modeText = (m.mode || "idle").toUpperCase();
-  const trainerBadge = (m.status === "training")
-    ? ` <span style="font-size:10px;padding:2px 6px;border:1px solid #666;border-radius:999px;opacity:.8">training</span>`
-    : "";
-  document.getElementById("mode").innerHTML = `<b>${modeText}</b>${trainerBadge}`;
+  document.getElementById("mode").innerHTML =
+    `<b>${(m.mode || m.status || "idle").toString().toUpperCase()}</b>` +
+    (m.status === "train-error" ? " ⚠️" : "");
   document.getElementById("equity").textContent = fmtUSD(m.equity);
   document.getElementById("pnl").textContent = fmtUSD(m.today_pnl);
   document.getElementById("trades").textContent = Number(m.today_trades || 0);
   document.getElementById("universe").textContent = Number(m.universe || 0);
   document.getElementById("dd").textContent = pct(m.max_drawdown);
-  document.getElementById("blockRisk").textContent = m.block_risk != null ? (Number(m.block_risk).toFixed(3)) : "–";
-  document.getElementById("blockCash").textContent = m.block_cash != null ? fmtUSD(m.block_cash) : "–";
+  document.getElementById("blockRisk").textContent =
+    m.block_risk != null ? Number(m.block_risk).toFixed(3) : "–";
+  document.getElementById("blockCash").textContent =
+    m.block_cash != null ? fmtUSD(m.block_cash) : "–";
   document.getElementById("cash").textContent = fmtUSD(m.cash);
   document.getElementById("invested").textContent = fmtUSD(m.positions_value);
   document.getElementById("upnl").textContent = fmtUSD(m.unrealized_pnl);
+
+  // reward / winrate / last train
+  const train = m.train || {};
+  document.getElementById("rewardMean").textContent =
+    Number(train.last_reward_mean || 0).toFixed(4);
+  document.getElementById("winRate").textContent =
+    `${(Number(train.last_win_rate || 0) * 100).toFixed(1)}%`;
+  document.getElementById("lastTrain").textContent =
+    train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
-// ---------- equity chart ----------
+// equity chart + benchmark (bright colors)
 let eqChart;
 async function loadEquity() {
   const bench = benchSymbol();
@@ -112,15 +105,38 @@ async function loadEquity() {
   if (!eqChart) {
     eqChart = new Chart(ctx, {
       type: "line",
-      data: { datasets: [
-        { label: "Equity", data: equityPts, tension: 0.25, pointRadius: 0, borderWidth: 2 },
-        { label: `Benchmark (${bench})`, data: benchPts, tension: 0.25, pointRadius: 0, borderWidth: 2, borderColor: "#ff6b6b" }
-      ]},
+      data: {
+        datasets: [
+          {
+            label: "Equity",
+            data: equityPts,
+            tension: 0.25,
+            pointRadius: 0,
+            borderWidth: 2,
+            borderColor: "#12d1c1",          // bright teal
+            backgroundColor: "rgba(18, 209, 193, 0.15)"
+          },
+          {
+            label: `Benchmark (${bench})`,
+            data: benchPts,
+            tension: 0.25,
+            pointRadius: 0,
+            borderWidth: 2,
+            borderDash: [6, 4],
+            borderColor: "#ff6b6b"
+          }
+        ]
+      },
       options: {
-        responsive: true, animation: false, parsing: true,
+        responsive: true,
+        animation: false,
+        parsing: true,
         interaction: { mode: "nearest", intersect: false },
-        scales: { x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" } }, y: { beginAtZero: false } },
-        plugins: { legend: { display: true } }
+        scales: {
+          x: { type: "time", time: { tooltipFormat: "MMM d, HH:mm" }, grid: { color: "rgba(255,255,255,0.06)" }, ticks: { color: "rgba(255,255,255,0.7)" } },
+          y: { beginAtZero: false, grid: { color: "rgba(255,255,255,0.06)" }, ticks: { color: "rgba(255,255,255,0.7)" } }
+        },
+        plugins: { legend: { display: true, labels: { color: "rgba(255,255,255,0.8)" } } }
       }
     });
   } else {
@@ -131,7 +147,7 @@ async function loadEquity() {
   }
 }
 
-// ---------- trades ----------
+// trades
 let tradesCursor = 0;
 async function loadTrades() {
   const payload = await getJSON(`/trades?limit=100&cursor=${tradesCursor}`);
@@ -141,6 +157,7 @@ async function loadTrades() {
   tbody.innerHTML = "";
   for (const r of rows) {
     const pnl = Number(r.realized_pnl || 0);
+    const showPnl = (r.side || "").toUpperCase() === "SELL";   // only show PnL on SELL
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${r.trade_id}</td>
@@ -152,15 +169,14 @@ async function loadTrades() {
       <td>${Number(r.fill_price||0).toFixed(2)}</td>
       <td>${Number(r.notional||0).toFixed(2)}</td>
       <td>${Number(r.risk_frac||0).toFixed(3)}</td>
-      <td class="${pnl>=0?'good':'bad'}">${pnl.toFixed(2)}</td>
+      <td class="${showPnl ? (pnl>=0?'good':'bad') : ''}">${showPnl ? pnl.toFixed(2) : "–"}</td>
       <td>${Number(r.equity_after||0).toFixed(2)}</td>
-      <td>${r.reason||""}</td>
-    `;
+      <td>${r.reason||""}</td>`;
     tbody.appendChild(tr);
   }
 }
 
-// ---------- training stats ----------
+// training stats (secondary)
 async function loadStats() {
   const s = await getJSON("/stats");
   const train = s.train || {};
@@ -170,21 +186,20 @@ async function loadStats() {
     train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
-// ---------- polling (staggered) ----------
-async function boot() {
-  // wait for server to wake before starting the loops
-  await waitForReady();
+// Polling (staggered)
+setInterval(() => loadMetrics().catch(() => {}), 5000);
+setInterval(() => loadTrades().catch(() => {}), 8000);
+setInterval(() => loadEquity().catch(() => {}), 20000);
+setInterval(() => loadStats().catch(() => {}), 25000);
 
-  // initial burst
-  try { await loadMetrics(); } catch {}
-  try { await loadEquity(); }  catch {}
-  try { await loadTrades(); }  catch {}
-  try { await loadStats(); }   catch {}
-
-  // recurring
-  setInterval(() => loadMetrics().catch(() => {}),  5000);
-  setInterval(() => loadTrades().catch(() => {}),  10000);
-  setInterval(() => loadEquity().catch(() => {}), 30000);
-  setInterval(() => loadStats().catch(() => {}),  30000);
-}
-boot();
+// initial
+(async () => {
+  try {
+    await loadMetrics();
+    await loadEquity();
+    await loadTrades();
+    await loadStats();
+  } catch (e) {
+    console.warn("Initial UI load error:", e.message);
+  }
+})();
