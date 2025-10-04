@@ -938,6 +938,15 @@ def admin_trade(req:TradeReq,_:None=Depends(require_key)):
     ADMIN_QUEUE.append(AdminOrder(side=side,ticker=req.ticker.upper(),notional=req.notional,qty=req.qty))
     return {"ok":True,"queued":True}
 
+@app.on_event("startup")
+def _start_threads_once():
+    if not getattr(_start_threads_once, "_started", False):
+        global STOP
+        STOP = threading.Event()
+        threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
+        threading.Thread(target=live_thread,   args=(STOP,), daemon=True).start()
+        _start_threads_once._started = True
+
 # ====== Boot threads ======
 STOP=threading.Event()
 threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
