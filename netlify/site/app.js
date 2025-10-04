@@ -1,16 +1,14 @@
-/* ===== Backend host selection (critical) =====
-   We try same-origin "/api" first (Netlify rewrite),
-   then fall back to the direct Render URL to avoid CDN timeouts.
+/* ===== Backend host selection =====
+   Netlify proxy uses /api prefix.
+   Direct Render backend is served at root (no /api).
 */
 const HOSTS = [];
-// 1) Same-origin (Netlify rewrite)
-HOSTS.push(location.origin.replace(/\/$/, "") + "/api");
-// 2) Direct Render backend (set in index.html or public/config.js)
+HOSTS.push({ base: location.origin.replace(/\/$/, ""), prefix: "/api" }); // Netlify rewrite
 if (typeof window !== "undefined" && window.API_FALLBACK) {
-  HOSTS.push(String(window.API_FALLBACK).replace(/\/$/, "") + "/api");
+  HOSTS.push({ base: String(window.API_FALLBACK).replace(/\/$/, ""), prefix: "" }); // direct FastAPI
 }
 
-// UI bits we’ll flip while the server is waking
+// Waking badge (unchanged)
 let serverSleeping = false;
 function setServerSleeping(flag) {
   serverSleeping = !!flag;
@@ -19,7 +17,6 @@ function setServerSleeping(flag) {
   el.style.display = serverSleeping ? "inline-block" : "none";
   el.textContent = "Waking server… (free instance)";
 }
-// If your HTML doesn’t have a spot for this, we’ll add a tiny one:
 (function ensureStatusBadge() {
   if (document.getElementById("serverStatus")) return;
   const badge = document.createElement("div");
@@ -30,26 +27,11 @@ function setServerSleeping(flag) {
   document.body.appendChild(badge);
 })();
 
-// ===== helpers =====
-const fmtUSD = (n) => {
-  const v = Number(n || 0);
-  const s = `$${Math.abs(v).toFixed(2)}`;
-  return v >= 0 ? s : `-${s}`;
-};
-const pct = (x) => `${(Number(x || 0) * 100).toFixed(2)}%`;
-const r6 = (x) => Number(x || 0).toFixed(6);
-
-// Hide buttons you asked to remove from UI (endpoints remain for admin)
-["pauseBtn", "resumeBtn", "manualBtn", "manualTradeBtn"].forEach((id) => {
-  const el = document.getElementById(id);
-  if (el) el.style.display = "none";
-});
-
 // ==== resilient fetch with fallback hosts, per-host timeout, and backoff ====
 async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9000 } = {}) {
   let lastErr;
-  for (const base of HOSTS) {
-    const url = base + path;
+  for (const host of HOSTS) {
+    const url = host.base + host.prefix + path;     // <— IMPORTANT: fallback has empty prefix
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -63,12 +45,10 @@ async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9
       clearTimeout(t);
       if (res.ok) return res.json();
       lastErr = new Error(`${res.status}`);
-      // If 5xx, try next host immediately
-      continue;
+      continue; // try next host
     } catch (e) {
       lastErr = e;
-      // network/timeout -> try next host
-      continue;
+      continue; // try next host
     }
   }
   throw lastErr || new Error("unreachable");
