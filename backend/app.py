@@ -508,6 +508,10 @@ def live_thread(stop: threading.Event):
 
                 backtest_session_id = f"bt-{int(time.time())}"
                 tznow = now_utc().astimezone(tz)
+
+                with STATE_LOCK:
+                    STATE['session_id'] = backtest_session_id
+                    
                 with get_db() as conn:
                     conn.execute("""INSERT INTO trades(
                         session_id,mode,ts_utc,ts_et,side,ticker,qty,fill_price,notional,
