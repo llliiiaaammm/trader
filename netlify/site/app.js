@@ -7,6 +7,15 @@ if (typeof window !== "undefined" && window.API_FALLBACK) {
   HOSTS.push({ base: String(window.API_FALLBACK).replace(/\/$/, ""), prefix: "" });
 }
 
+// tiny helpers (were missing)
+const fmtUSD = (n) => {
+  const v = Number(n || 0);
+  const s = `$${Math.abs(v).toFixed(2)}`;
+  return v >= 0 ? s : `-${s}`;
+};
+const pct = (x) => `${(Number(x || 0) * 100).toFixed(2)}%`;
+const r6  = (x) => Number(x || 0).toFixed(6);
+
 /* Waking badge */
 let serverSleeping = false;
 function setServerSleeping(flag) {
