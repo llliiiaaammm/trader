@@ -61,7 +61,8 @@
       <div>Reward ⌀ <b id="rewardMean">0.0000</b></div>
       <div>Win rate <b id="winRate">0.0%</b></div>
       <div>Last train <b id="lastTrain">–</b></div>
-      <div class="muted">Benchmark: <span class="pill">SPY</span></div>
+      <!-- Left stats card: give the pill an id so JS can update it -->
+      <div class="muted">Benchmark: <span id="benchLabel" class="pill">SPY</span></div>
     </div>
 
     <div>
@@ -84,12 +85,16 @@
       <pre id="paramsBox" class="card" style="display:none; white-space:pre-wrap; margin-top:14px; max-height:260px; overflow:auto;"></pre>
     </div>
   </div>
-
+  
+  <!-- Scripts (order matters): Chart.js, adapter, FALLBACK config, then app.js -->
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0"></script>
-  <script src="./app.js"></script>
+  
+  <!-- set BEFORE app.js so HOSTS includes it -->
   <script>
-    window.API_FALLBACK = "https://trader-2slp.onrender.com";
+    window.API_FALLBACK = "https://trader-2slp.onrender.com";  // no trailing slash
   </script>
+  
+  <script src="./app.js"></script>
 </body>
 </html>
