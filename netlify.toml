@@ -3,6 +3,7 @@
   node_bundler = "esbuild"
 
 [[redirects]]
-  from = "/api/*"
-  to = "/.netlify/functions/proxy"
-  status = 200
+from = "/api/*"
+to   = "https://trader-2slp.onrender.com/:splat"
+status = 200
+force = true
