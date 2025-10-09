@@ -1,6 +1,6 @@
 /* ===== Backend host selection ===== */
 const HOSTS = [];
-// Netlify proxy: /api/xxx -> backend
+// Netlify proxy: /api/xxx -> backend (same-origin, no CORS)
 HOSTS.push({ base: location.origin.replace(/\/$/, ""), prefix: "/api" });
 // Direct Render backend (no /api prefix)
 if (typeof window !== "undefined" && window.API_FALLBACK) {
@@ -34,12 +34,26 @@ function setServerSleeping(flag) {
   document.body.appendChild(badge);
 })();
 
+/* Wake the Render server without tripping CORS (opaque request) */
+async function wakeServer() {
+  if (!window.API_FALLBACK) return;
+  try {
+    const base = String(window.API_FALLBACK).replace(/\/$/, "");
+    // a couple of pings with increasing gaps
+    for (let i = 0; i < 3; i++) {
+      try { await fetch(base + "/healthz", { mode: "no-cors", cache: "no-store" }); } catch {}
+      await new Promise(r => setTimeout(r, 1200 * (i + 1)));
+    }
+  } catch {}
+}
+wakeServer();
+
 /* Robust fetch with fallback + timeout */
-async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9000 } = {}) {
+async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 15000 } = {}) {
   setServerSleeping(true);
   let lastErr;
   for (const host of HOSTS) {
-    const url = host.base + host.prefix + path;   // fallback prefix is "" (no /api)
+    const url = host.base + host.prefix + path;
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -62,14 +76,14 @@ async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9
       // try next host
     }
   }
-  setServerSleeping(true); // still sleeping/unreachable
+  setServerSleeping(true);
   throw lastErr || new Error("unreachable");
 }
 
 const getJSON  = (p) => fetchJSONWithFallback(p);
 const postJSON = (p, body) => fetchJSONWithFallback(p, { method: "POST", body });
 
-/* Adaptive poll wrapper: backs off when failing (sleepy server) */
+/* Adaptive poller with backoff */
 function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
   let delay = min, timer = null, running = false;
 
@@ -78,10 +92,10 @@ function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
     running = true;
     try {
       await fn();
-      delay = min;           // success: reset
+      delay = min;
       setServerSleeping(false);
     } catch (e) {
-      delay = Math.min(max, Math.ceil(delay * step)); // backoff
+      delay = Math.min(max, Math.ceil(delay * step));
       setServerSleeping(true);
     } finally {
       running = false;
@@ -92,7 +106,7 @@ function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
   return { stop: () => timer && clearTimeout(timer) };
 }
 
-/* Admin — Reset only (password prompt) */
+/* Admin: Reset */
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password to reset all model & trades:");
   if (!pwd) return;
@@ -144,7 +158,7 @@ async function loadMetrics() {
     train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
-/* Equity chart (bright) + benchmark */
+/* Equity chart + benchmark */
 let eqChart;
 async function loadEquity() {
   const bench = benchSymbol();
@@ -205,7 +219,7 @@ async function loadEquity() {
   }
 }
 
-/* Trades (PnL only on SELL) */
+/* Trades */
 let tradesCursor = 0;
 async function loadTrades() {
   const payload = await fetchJSONWithFallback(`/trades?limit=100&cursor=${tradesCursor}`);
