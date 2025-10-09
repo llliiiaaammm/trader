@@ -1,13 +1,13 @@
 /* ===== Backend host selection ===== */
 const HOSTS = [];
-// Netlify proxy: /api/xxx -> your backend
+// Netlify proxy: /api/xxx -> backend
 HOSTS.push({ base: location.origin.replace(/\/$/, ""), prefix: "/api" });
 // Direct Render backend (no /api prefix)
 if (typeof window !== "undefined" && window.API_FALLBACK) {
   HOSTS.push({ base: String(window.API_FALLBACK).replace(/\/$/, ""), prefix: "" });
 }
 
-// tiny helpers (were missing)
+/* Tiny helpers */
 const fmtUSD = (n) => {
   const v = Number(n || 0);
   const s = `$${Math.abs(v).toFixed(2)}`;
@@ -39,7 +39,7 @@ async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9
   setServerSleeping(true);
   let lastErr;
   for (const host of HOSTS) {
-    const url = host.base + host.prefix + path;   // NOTE: fallback prefix is "" (no /api)
+    const url = host.base + host.prefix + path;   // fallback prefix is "" (no /api)
     try {
       const ctrl = new AbortController();
       const t = setTimeout(() => ctrl.abort(), timeoutMs);
@@ -66,11 +66,10 @@ async function fetchJSONWithFallback(path, { method = "GET", body, timeoutMs = 9
   throw lastErr || new Error("unreachable");
 }
 
-// Use the new helper everywhere app.js was calling your old getJSON/postJSON:
 const getJSON  = (p) => fetchJSONWithFallback(p);
 const postJSON = (p, body) => fetchJSONWithFallback(p, { method: "POST", body });
 
-// adaptive poll wrapper: backs off when failing (for sleepy servers)
+/* Adaptive poll wrapper: backs off when failing (sleepy server) */
 function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
   let delay = min, timer = null, running = false;
 
@@ -82,8 +81,7 @@ function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
       delay = min;           // success: reset
       setServerSleeping(false);
     } catch (e) {
-      // failure: back off
-      delay = Math.min(max, Math.ceil(delay * step));
+      delay = Math.min(max, Math.ceil(delay * step)); // backoff
       setServerSleeping(true);
     } finally {
       running = false;
@@ -94,12 +92,11 @@ function makePoller(fn, { min = 5000, max = 45000, step = 1.8 } = {}) {
   return { stop: () => timer && clearTimeout(timer) };
 }
 
-// ===== Admin: only Reset visible (still points to current host set) =====
+/* Admin — Reset only (password prompt) */
 document.getElementById("resetBtn")?.addEventListener("click", async () => {
   const pwd = prompt("Admin password to reset all model & trades:");
   if (!pwd) return;
   try {
-    // Try across hosts the same way
     await fetchJSONWithFallback("/admin/reset", { method: "POST", body: { password: pwd } });
     alert("Reset complete.");
   } catch (e) {
@@ -107,7 +104,7 @@ document.getElementById("resetBtn")?.addEventListener("click", async () => {
   }
 });
 
-// ===== Benchmark control (click the small tag) =====
+/* Benchmark control (click the pill) */
 const BENCH_KEY = "benchSymbol";
 const benchSymbol = () => localStorage.getItem(BENCH_KEY) || "SPY";
 const setBench = (s) => localStorage.setItem(BENCH_KEY, (s || "SPY").toUpperCase());
@@ -119,7 +116,7 @@ document.getElementById("benchLabel")?.addEventListener("click", async () => {
   try { await loadEquity(); } catch {}
 });
 
-// ===== metrics =====
+/* Metrics */
 async function loadMetrics() {
   const m = await fetchJSONWithFallback("/metrics");
   document.getElementById("mode").innerHTML =
@@ -147,7 +144,7 @@ async function loadMetrics() {
     train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
-// ===== equity chart (bright line) + benchmark =====
+/* Equity chart (bright) + benchmark */
 let eqChart;
 async function loadEquity() {
   const bench = benchSymbol();
@@ -208,7 +205,7 @@ async function loadEquity() {
   }
 }
 
-// ===== trades (PnL only on SELL; qty/notional precision capped) =====
+/* Trades (PnL only on SELL) */
 let tradesCursor = 0;
 async function loadTrades() {
   const payload = await fetchJSONWithFallback(`/trades?limit=100&cursor=${tradesCursor}`);
@@ -219,7 +216,7 @@ async function loadTrades() {
   for (const r of rows) {
     const side = (r.side || "").toUpperCase();
     const pnl = Number(r.realized_pnl || 0);
-    const showPnl = side === "SELL"; // only on exit
+    const showPnl = side === "SELL";
     const tr = document.createElement("tr");
     tr.innerHTML = `
       <td>${r.trade_id}</td>
@@ -238,7 +235,7 @@ async function loadTrades() {
   }
 }
 
-// ===== Stats (secondary) =====
+/* Secondary stats */
 async function loadStats() {
   const s = await fetchJSONWithFallback("/stats");
   const train = s.train || {};
@@ -248,11 +245,11 @@ async function loadStats() {
     train.last_time_utc ? new Date(train.last_time_utc).toLocaleString() : "–";
 }
 
-// ===== Start adaptive pollers =====
+/* Start adaptive pollers */
 makePoller(loadMetrics, { min: 4000, max: 30000, step: 1.8 });
 makePoller(loadTrades,  { min: 7000, max: 45000, step: 1.8 });
 makePoller(loadEquity,  { min: 12000, max: 60000, step: 1.8 });
 makePoller(loadStats,   { min: 20000, max: 60000, step: 1.8 });
 
-// Initial badge state hidden
+/* Initial badge state hidden */
 setServerSleeping(false);
