@@ -376,17 +376,13 @@ def build_env() -> Tuple['Env', List[str], HistoryBundle]:
     return env, list(env.tickers), bundle
 
 def build_env_safe() -> Tuple['Env', List[str], HistoryBundle]:
-    """
-    Always returns a non-empty Env. Falls back to synthetic if anything fails
-    or if we end up with 0 assets.
-    """
+    """Always returns a non-empty Env. Falls back to synthetic if needed."""
     try:
         env, tickers, bundle = build_env()
         if getattr(env, "N_assets", 0) >= 1 and len(getattr(env, "valid", [])) >= 1:
             return env, tickers, bundle
     except Exception:
         pass
-
     # Hard fallback: guaranteed synthetic
     idx = pd.date_range(end=now_utc().date(), periods=240, freq="D")
     synth_cols = ["AAPL", "MSFT", "AMZN"]
@@ -636,8 +632,7 @@ def live_thread(stop: threading.Event):
                 with STATE_LOCK: STATE['status'] = STATE['mode'] = 'live'
                 if live_session_id is None:
                     start_live_session()
-
-                # (live trading body omitted for brevity; unchanged from earlier)
+                # (live trading logic could be added here)
                 time.sleep(POLL_SECONDS)
                 continue
 
@@ -671,31 +666,30 @@ def live_thread(stop: threading.Event):
                     "realized_pnl": 0.0, "realized_pnl_pct": 0.0, "equity_after": eq, "reason": "block start"
                 })
 
-                # one-bar hold: insert BUY at t with 0 PnL, SELL at t+1 with realized PnL
+                # one-bar hold: BUY at t with 0 PnL, SELL at t+1 with realized PnL
                 for _ in range(2000):
                     if PAUSED.is_set(): break
 
-                    # choose action for this bar
                     a, _, _ = agent.act(back_obs)
-
-                    # step env to next bar and compute outcome
                     nobs, _, done, back_s, realized_r, exec_price = env.step(a, back_s)
+
                     risk = float(back_obs[0,-1])
                     notional = eq * risk
                     fee = abs(notional) * FEE_BPS
 
-                    # derive prior price from next price and realized return
                     entry_price = exec_price / max(1.0 + realized_r, 1e-8)
                     qty = abs(notional) / max(entry_price, 1e-6)
 
-                    # record BUY (entry) with 0 realized PnL
+                    # BUY (entry) — 0 realized PnL
                     ts_buy_utc = now_utc().isoformat()
                     ts_buy_et = now_utc().astimezone(tz).isoformat()
                     insert_trade({
                         "session_id": backtest_session_id, "mode": "BACKTEST",
                         "ts_utc": ts_buy_utc, "ts_et": ts_buy_et,
-                        "side": "BUY", "ticker": (env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"),
-                        "qty": r6(qty if a != env.cash_idx else 0.0), "fill_price": r2(entry_price if a != env.cash_idx else 0.0),
+                        "side": "BUY" if a != env.cash_idx else "HOLD",
+                        "ticker": (env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"),
+                        "qty": r6(qty if a != env.cash_idx else 0.0),
+                        "fill_price": r2(entry_price if a != env.cash_idx else 0.0),
                         "notional": r2(abs(notional) if a != env.cash_idx else 0.0),
                         "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
                         "risk_frac": risk, "position_before": 0.0, "position_after": 0.0,
@@ -704,18 +698,19 @@ def live_thread(stop: threading.Event):
                         "equity_after": r2(eq), "reason": "entry"
                     })
 
-                    # compute realized PnL for exit
                     pnl = notional * realized_r - fee
                     eq += pnl
 
-                    # record SELL (exit) with realized PnL
+                    # SELL (exit) — realized PnL shown here
                     ts_sell_utc = now_utc().isoformat()
                     ts_sell_et = now_utc().astimezone(tz).isoformat()
                     insert_trade({
                         "session_id": backtest_session_id, "mode": "BACKTEST",
                         "ts_utc": ts_sell_utc, "ts_et": ts_sell_et,
-                        "side": "SELL" if a != env.cash_idx else "HOLD", "ticker": (env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"),
-                        "qty": r6(qty if a != env.cash_idx else 0.0), "fill_price": r2(exec_price if a != env.cash_idx else 0.0),
+                        "side": "SELL" if a != env.cash_idx else "HOLD",
+                        "ticker": (env.tickers[a] if a != env.cash_idx and a < env.N_assets else "CASH"),
+                        "qty": r6(qty if a != env.cash_idx else 0.0),
+                        "fill_price": r2(exec_price if a != env.cash_idx else 0.0),
                         "notional": r2(abs(notional) if a != env.cash_idx else 0.0),
                         "fees_bps": FEE_BPS, "slippage_bps": SLIPPAGE_BPS,
                         "risk_frac": risk, "position_before": 0.0, "position_after": 0.0,
@@ -732,7 +727,7 @@ def live_thread(stop: threading.Event):
                         STATE['peak_equity'] = peak_eq
                         STATE['max_drawdown'] = float(0.0 if peak_eq<=0 else (peak_eq - eq)/peak_eq)
                         STATE['equity'] = r2(eq)
-                        STATE['cash'] = r2(eq)  # positions are closed each step
+                        STATE['cash'] = r2(eq)  # flat each step
                         STATE['positions_value'] = 0.0
                         STATE['unrealized_pnl'] = 0.0
 
@@ -779,7 +774,6 @@ def mode():
 def metrics():
     with STATE_LOCK:
         st = STATE.copy()
-    # always include training snapshot so UI doesn't show blanks
     tr = {
         "last_reward_mean": float(TRAIN_STATS.get("last_reward_mean") or 0.0),
         "last_win_rate": float(TRAIN_STATS.get("last_win_rate") or 0.0),
@@ -812,13 +806,13 @@ def trades(limit:int=Query(100,ge=1,le=500),cursor:int=0,session:Optional[str]=N
         r["realized_pnl"]=r2(r.get("realized_pnl",0)); r["equity_after"]=r2(r.get("equity_after",0))
     return {"data":rows,"next_cursor":next_cursor,"session":session}
 
-# ---- small in-memory cache for benchmark ----
+# ---- in-memory cache for benchmark ----
 _BENCH_CACHE: Dict[Tuple[str,str,str,str], Tuple[float, List[Dict[str,float]]]] = {}
 def _cached_bench(bench_sym:str,t0:datetime,t1:datetime,interval:str)->List[Dict[str,float]]:
     key=(bench_sym, t0.date().isoformat(), t1.date().isoformat(), interval)
     now=time.time()
     ent=_BENCH_CACHE.get(key)
-    if ent and (now-ent[0] < 300):  # cache 5 minutes
+    if ent and (now-ent[0] < 300):  # 5 min cache
         return ent[1]
     try:
         df=yf.download(bench_sym, start=t0, end=t1+timedelta(days=1), interval=interval, auto_adjust=True, progress=False)
@@ -889,8 +883,9 @@ def snapshot(_:None=Depends(require_key)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
+# NOTE: admin endpoints only require password (no bearer) for the simple demo UI
 @app.post("/admin/reset")
-def admin_reset(req:ResetReq,_:None=Depends(require_key)):
+def admin_reset(req:ResetReq):
     if req.password!=API_KEY and req.password!=os.getenv("ADMIN_RESET_PASSWORD","please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
     with STATE_LOCK: STATE['status']=STATE['mode']='resetting'
@@ -910,7 +905,7 @@ def admin_reset(req:ResetReq,_:None=Depends(require_key)):
     return {"ok":True}
 
 @app.post("/admin/pause")
-def admin_pause(req:PauseReq,_:None=Depends(require_key)):
+def admin_pause(req:PauseReq):
     if req.password!=API_KEY and req.password!=os.getenv("ADMIN_RESET_PASSWORD","please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
     PAUSED.set()
@@ -920,7 +915,7 @@ def admin_pause(req:PauseReq,_:None=Depends(require_key)):
     return {"ok":True,"paused":True}
 
 @app.post("/admin/resume")
-def admin_resume(req:PauseReq,_:None=Depends(require_key)):
+def admin_resume(req:PauseReq):
     if req.password!=API_KEY and req.password!=os.getenv("ADMIN_RESET_PASSWORD","please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
     PAUSED.clear()
@@ -929,7 +924,7 @@ def admin_resume(req:PauseReq,_:None=Depends(require_key)):
     return {"ok":True,"paused":False}
 
 @app.post("/admin/trade")
-def admin_trade(req:TradeReq,_:None=Depends(require_key)):
+def admin_trade(req:TradeReq):
     if req.password!=API_KEY and req.password!=os.getenv("ADMIN_RESET_PASSWORD","please-change-me"):
         raise HTTPException(403, detail="Bad admin password")
     side=req.side.upper()
@@ -938,19 +933,16 @@ def admin_trade(req:TradeReq,_:None=Depends(require_key)):
     ADMIN_QUEUE.append(AdminOrder(side=side,ticker=req.ticker.upper(),notional=req.notional,qty=req.qty))
     return {"ok":True,"queued":True}
 
+# ====== Boot threads on app startup (guarded so it never double-starts) ======
+STOP = threading.Event()
+
 @app.on_event("startup")
 def _start_threads_once():
-    if not getattr(_start_threads_once, "_started", False):
-        global STOP
-        STOP = threading.Event()
-        threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
-        threading.Thread(target=live_thread,   args=(STOP,), daemon=True).start()
-        _start_threads_once._started = True
-
-# ====== Boot threads ======
-STOP=threading.Event()
-threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
-threading.Thread(target=live_thread,   args=(STOP,), daemon=True).start()
+    if getattr(_start_threads_once, "_started", False):
+        return
+    threading.Thread(target=trainer_thread, args=(STOP,), daemon=True).start()
+    threading.Thread(target=live_thread,   args=(STOP,), daemon=True).start()
+    _start_threads_once._started = True
 
 if __name__=="__main__":
     if API_KEY=="changeme":
