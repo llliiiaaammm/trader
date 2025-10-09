@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.optim as optim
 from fastapi import FastAPI, Header, HTTPException, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, Response, PlainTextResponse
 from pydantic import BaseModel
 import uvicorn
 
@@ -331,7 +331,7 @@ STATE={
 }
 TRAIN_STATS={"last_reward_mean":0.0,"last_win_rate":0.0,"last_time_utc":None}
 
-# ===================== PORTFOLIO (for live) =====================
+# ===================== PORTFOLIO =====================
 class Portfolio:
     def __init__(self,cash:float):
         self.cash=float(cash); self.positions={}; self.cost_basis={}; self.equity=float(cash); self.realized_pnl=0.0; self.unrealized_pnl=0.0
@@ -376,14 +376,13 @@ def build_env() -> Tuple['Env', List[str], HistoryBundle]:
     return env, list(env.tickers), bundle
 
 def build_env_safe() -> Tuple['Env', List[str], HistoryBundle]:
-    """Always returns a non-empty Env. Falls back to synthetic if needed."""
+    """Always returns a non-empty Env; falls back to synthetic."""
     try:
         env, tickers, bundle = build_env()
         if getattr(env, "N_assets", 0) >= 1 and len(getattr(env, "valid", [])) >= 1:
             return env, tickers, bundle
     except Exception:
         pass
-    # Hard fallback: guaranteed synthetic
     idx = pd.date_range(end=now_utc().date(), periods=240, freq="D")
     synth_cols = ["AAPL", "MSFT", "AMZN"]
     synth = {c: 100 + np.cumsum(np.random.normal(0, 1, len(idx))) for c in synth_cols}
@@ -627,16 +626,13 @@ def live_thread(stop: threading.Event):
 
             live_open = is_market_open(now_utc())
 
-            # ----------------- LIVE -----------------
             if live_open:
                 with STATE_LOCK: STATE['status'] = STATE['mode'] = 'live'
                 if live_session_id is None:
                     start_live_session()
-                # (live trading logic could be added here)
                 time.sleep(POLL_SECONDS)
                 continue
 
-            # ----------------- BACKTEST (market closed) -----------------
             if BACKTEST_WHEN_CLOSED:
                 with STATE_LOCK:
                     STATE['status'] = 'backtest'
@@ -666,10 +662,8 @@ def live_thread(stop: threading.Event):
                     "realized_pnl": 0.0, "realized_pnl_pct": 0.0, "equity_after": eq, "reason": "block start"
                 })
 
-                # one-bar hold: BUY at t with 0 PnL, SELL at t+1 with realized PnL
                 for _ in range(2000):
                     if PAUSED.is_set(): break
-
                     a, _, _ = agent.act(back_obs)
                     nobs, _, done, back_s, realized_r, exec_price = env.step(a, back_s)
 
@@ -680,7 +674,6 @@ def live_thread(stop: threading.Event):
                     entry_price = exec_price / max(1.0 + realized_r, 1e-8)
                     qty = abs(notional) / max(entry_price, 1e-6)
 
-                    # BUY (entry) — 0 realized PnL
                     ts_buy_utc = now_utc().isoformat()
                     ts_buy_et = now_utc().astimezone(tz).isoformat()
                     insert_trade({
@@ -701,7 +694,6 @@ def live_thread(stop: threading.Event):
                     pnl = notional * realized_r - fee
                     eq += pnl
 
-                    # SELL (exit) — realized PnL shown here
                     ts_sell_utc = now_utc().isoformat()
                     ts_sell_et = now_utc().astimezone(tz).isoformat()
                     insert_trade({
@@ -727,7 +719,7 @@ def live_thread(stop: threading.Event):
                         STATE['peak_equity'] = peak_eq
                         STATE['max_drawdown'] = float(0.0 if peak_eq<=0 else (peak_eq - eq)/peak_eq)
                         STATE['equity'] = r2(eq)
-                        STATE['cash'] = r2(eq)  # flat each step
+                        STATE['cash'] = r2(eq)
                         STATE['positions_value'] = 0.0
                         STATE['unrealized_pnl'] = 0.0
 
@@ -743,12 +735,22 @@ def live_thread(stop: threading.Event):
             time.sleep(POLL_SECONDS)
 
 # ===================== API =====================
-app=FastAPI()
+app = FastAPI()
+
+# CORS: allow everything (frontends proxying or direct)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[CORS_ORIGIN] if CORS_ORIGIN!="*" else ["*"],
-    allow_credentials=False, allow_methods=["*"], allow_headers=["*"]
+    allow_origins=[] if CORS_ORIGIN == "*" else [CORS_ORIGIN],
+    allow_origin_regex=".*" if CORS_ORIGIN == "*" else None,
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
+
+# Tiny favicon to silence 404s in the console
+@app.get("/favicon.ico")
+def favicon():  # returns 204 No Content
+    return Response(status_code=204)
 
 def require_key(authorization: Optional[str] = Header(default=None)):
     if not authorization or not authorization.lower().startswith("bearer "):
@@ -806,13 +808,13 @@ def trades(limit:int=Query(100,ge=1,le=500),cursor:int=0,session:Optional[str]=N
         r["realized_pnl"]=r2(r.get("realized_pnl",0)); r["equity_after"]=r2(r.get("equity_after",0))
     return {"data":rows,"next_cursor":next_cursor,"session":session}
 
-# ---- in-memory cache for benchmark ----
+# ---- benchmark cache ----
 _BENCH_CACHE: Dict[Tuple[str,str,str,str], Tuple[float, List[Dict[str,float]]]] = {}
 def _cached_bench(bench_sym:str,t0:datetime,t1:datetime,interval:str)->List[Dict[str,float]]:
     key=(bench_sym, t0.date().isoformat(), t1.date().isoformat(), interval)
     now=time.time()
     ent=_BENCH_CACHE.get(key)
-    if ent and (now-ent[0] < 300):  # 5 min cache
+    if ent and (now-ent[0] < 300):
         return ent[1]
     try:
         df=yf.download(bench_sym, start=t0, end=t1+timedelta(days=1), interval=interval, auto_adjust=True, progress=False)
@@ -861,7 +863,7 @@ def equity(window:str="30d",session:Optional[str]=None,bench:Optional[str]=None)
 
     return {"series":series,"bench":bench_out,"session":session}
 
-# ---------- Admin ----------
+# ---------- Admin (no bearer, simple demo UI) ----------
 class ResetReq(BaseModel): password:str
 class PauseReq(BaseModel): password:str
 class TradeReq(BaseModel):
@@ -883,7 +885,6 @@ def snapshot(_:None=Depends(require_key)):
     except Exception as e:
         raise HTTPException(500, detail=str(e))
 
-# NOTE: admin endpoints only require password (no bearer) for the simple demo UI
 @app.post("/admin/reset")
 def admin_reset(req:ResetReq):
     if req.password!=API_KEY and req.password!=os.getenv("ADMIN_RESET_PASSWORD","please-change-me"):
@@ -933,7 +934,7 @@ def admin_trade(req:TradeReq):
     ADMIN_QUEUE.append(AdminOrder(side=side,ticker=req.ticker.upper(),notional=req.notional,qty=req.qty))
     return {"ok":True,"queued":True}
 
-# ====== Boot threads on app startup (guarded so it never double-starts) ======
+# ====== Boot threads on startup (guarded) ======
 STOP = threading.Event()
 
 @app.on_event("startup")
